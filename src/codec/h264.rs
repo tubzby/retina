@@ -433,9 +433,9 @@ impl Depacketizer {
         let mut is_disposable = true;
         let mut new_sps = None;
         let mut new_pps = None;
-        let mut insert_sps_pps;
-        let mut has_idr;
-        let mut has_sps_pps;
+        let mut insert_sps_pps = false;
+        let mut has_idr = false;
+        let mut has_sps_pps = false;
 
         if log_enabled!(log::Level::Debug) {
             self.log_access_unit(&au, reason);
@@ -491,7 +491,7 @@ impl Depacketizer {
         // we only insert one sps + pps on the start
         if insert_sps_pps {
             if let Some(param) = &self.parameters {
-                retained_len += (8 + param.sps_nal.len() + param.pps_nal.len());
+                retained_len += 8 + param.sps_nal.len() + param.pps_nal.len();
             }
         }
         let mut data = Vec::with_capacity(retained_len);
