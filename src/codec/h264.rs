@@ -433,10 +433,26 @@ impl Depacketizer {
         let mut is_disposable = true;
         let mut new_sps = None;
         let mut new_pps = None;
+        let mut insert_sps_pps;
+        let mut has_idr;
+        let mut has_sps_pps;
 
         if log_enabled!(log::Level::Debug) {
             self.log_access_unit(&au, reason);
         }
+
+        for nal in &self.nals {
+            match nal.hdr.nal_unit_type() {
+                UnitType::SeqParameterSet | UnitType::PicParameterSet => has_sps_pps = true,
+                UnitType::SliceLayerWithoutPartitioningIdr => has_idr = true,
+                _ => {}
+            }
+        }
+        // idr need sps pps
+        if has_idr & !has_sps_pps && self.parameters.is_some() {
+            insert_sps_pps = true;
+        }
+
         for nal in &self.nals {
             let next_piece_idx = usize::try_from(nal.next_piece_idx).expect("u32 fits in usize");
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
@@ -471,8 +487,25 @@ impl Depacketizer {
             retained_len += 4usize + usize::try_from(nal.len).expect("u32 fits in usize");
             piece_idx = next_piece_idx;
         }
+
+        // we only insert one sps + pps on the start
+        if insert_sps_pps {
+            if let Some(param) = &self.parameters {
+                retained_len += (8 + param.sps_nal.len() + param.pps_nal.len());
+            }
+        }
         let mut data = Vec::with_capacity(retained_len);
         piece_idx = 0;
+
+        if insert_sps_pps {
+            if let Some(param) = &self.parameters {
+                data.extend_from_slice(&param.sps_nal.len().to_be_bytes()[..]);
+                data.extend_from_slice(&param.sps_nal);
+                data.extend_from_slice(&param.pps_nal.len().to_be_bytes()[..]);
+                data.extend_from_slice(&param.pps_nal);
+            }
+        }
+
         for nal in &self.nals {
             let next_piece_idx = usize::try_from(nal.next_piece_idx).expect("u32 fits in usize");
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
