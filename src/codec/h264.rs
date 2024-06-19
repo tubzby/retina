@@ -499,9 +499,11 @@ impl Depacketizer {
 
         if insert_sps_pps {
             if let Some(param) = &self.parameters {
-                data.extend_from_slice(&param.sps_nal.len().to_be_bytes()[..]);
+                let len = param.sps_nal.len() as u32;
+                data.extend_from_slice(&len.to_be_bytes()[..]);
                 data.extend_from_slice(&param.sps_nal);
-                data.extend_from_slice(&param.pps_nal.len().to_be_bytes()[..]);
+                let len = param.pps_nal.len() as u32;
+                data.extend_from_slice(&len.to_be_bytes()[..]);
                 data.extend_from_slice(&param.pps_nal);
             }
         }
