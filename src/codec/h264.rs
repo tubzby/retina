@@ -437,11 +437,18 @@ impl Depacketizer {
             UnitType::SeqParameterSet | UnitType::PicParameterSet => {}
             _ => return false,
         }
-        let piece = &self.pieces[0];
-        piece
-            .windows(piece.len())
-            .find(|window| *window == START_CODE)
+        let piece = &self.pieces[0][..];
+        if piece
+            .windows(START_CODE.len())
+            .position(|window| window == START_CODE)
             .is_some()
+        {
+            println!("found start code");
+            true
+        } else {
+            println!("not found start code");
+            false
+        }
     }
 
     /// sometimes SPS-PPS was insert before IDR, and the nalu is marked as SPS
@@ -457,7 +464,7 @@ impl Depacketizer {
         loop {
             let haystack = &piece[start..];
             if let Some(pos) = haystack
-                .windows(haystack.len())
+                .windows(START_CODE.len())
                 .position(|window| window == START_CODE)
             {
                 debug!("found AnnexB start code");
@@ -1480,14 +1487,14 @@ mod tests {
                 stream_id: 0,
                 timestamp,
                 ssrc: 0,
-                sequence_number: 2,
+                sequence_number: 0,
                 loss: 0,
                 mark: false,
                 payload_type: 0,
             }
             .build(*b"\x7c\x87\
                     \x4d\x00\x16\x8d\x8d\x40\x50\x17\xfc\xb3\x70\x10\x10\x14\x00\x00\x1c\x20\x00\x05\x7e\x40\x10\
-                    \x00\x00\x00\x01\x68\
+                    \x00\x00\x00\x01\
                     \x68\xee\x3c\x80
                     \x00\x00\x00\x01\x65idr start")
             .unwrap(),
@@ -1501,7 +1508,7 @@ mod tests {
                 stream_id: 0,
                 timestamp,
                 ssrc: 0,
-                sequence_number: 3,
+                sequence_number: 1,
                 loss: 0,
                 mark: false,
                 payload_type: 0,
@@ -1518,7 +1525,7 @@ mod tests {
                 stream_id: 0,
                 timestamp,
                 ssrc: 0,
-                sequence_number: 4,
+                sequence_number: 2,
                 loss: 0,
                 mark: true,
                 payload_type: 0,
@@ -1533,10 +1540,9 @@ mod tests {
         };
         assert_eq!(
             frame.data(),
-            b"\x00\x00\x00\x0a\x67sps start\
-                \x00\x00\x00\x0a\x68pps start\
-                \x00\x00\x00\x21\x65idr start, fu-a middle, fu-a end
-                \x00\x00\x00\x04\x01plain"
+            b"\x67\x4d\x00\x16\x8d\x8d\x40\x50\x17\xfc\xb3\x70\x10\x10\x14\x00\x00\x1c\x20\x00\x05\x7e\x40\x10\
+              \x68\xee\x3c\x80\
+              \x00\x00\x00\x21\x65idr start, fu-a middle, fu-a end"
         );
     }
 
