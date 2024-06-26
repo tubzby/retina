@@ -18,6 +18,10 @@ use crate::{
 
 use super::VideoFrame;
 
+/// wheter we insert sps/pps before IDR
+const INSERT_PARAMETER: bool = false;
+const START_CODE: &[u8] = b"\x00\x00\x00\x01";
+
 /// A [super::Depacketizer] implementation which finds access unit boundaries
 /// and produces unfragmented NAL units as specified in [RFC
 /// 6184](https://tools.ietf.org/html/rfc6184).
@@ -366,7 +370,7 @@ impl Depacketizer {
         }
         self.input_state = if mark {
             let last_nal_hdr = self.nals.last().unwrap().hdr;
-            if can_end_au(last_nal_hdr.nal_unit_type()) {
+            if can_end_au(last_nal_hdr.nal_unit_type()) || self.should_fire() {
                 access_unit.end_ctx = ctx;
                 self.pending = Some(self.finalize_access_unit(access_unit, "mark")?);
                 DepacketizerInputState::PostMark { timestamp, loss: 0 }
@@ -426,6 +430,76 @@ impl Depacketizer {
         }
     }
 
+    /// if this is SPS PPS and [START_CODE] was found in
+    fn should_fire(&mut self) -> bool {
+        let last = self.nals.last().unwrap();
+        match last.hdr.nal_unit_type() {
+            UnitType::SeqParameterSet | UnitType::PicParameterSet => {}
+            _ => return false,
+        }
+        let piece = &self.pieces[0];
+        piece
+            .windows(piece.len())
+            .find(|window| *window == START_CODE)
+            .is_some()
+    }
+
+    /// sometimes SPS-PPS was insert before IDR, and the nalu is marked as SPS
+    /// we only deal with first nal with
+    fn split_combind_nalu(&mut self) -> Result<(), String> {
+        let mut new_pieces = Vec::new();
+
+        let piece = &self.pieces[0];
+
+        // we only find the first piece
+        let mut start = 0usize;
+        let mut next_piece_idx = 1;
+        loop {
+            let haystack = &piece[start..];
+            if let Some(pos) = haystack
+                .windows(haystack.len())
+                .position(|window| window == START_CODE)
+            {
+                debug!("found AnnexB start code");
+                // save current nalu, and copy to a new Bytes
+                let mut new_piece: Vec<u8> = Vec::new();
+                new_piece.extend_from_slice(&haystack[..pos]);
+                let hdr = NalHeader::new(haystack[0])
+                    .map_err(|_| format!("bad header {:02x} in STAP-A", haystack[0]))?;
+                let nalu = Nal {
+                    hdr,
+                    next_piece_idx,
+                    len: pos as u32,
+                };
+                new_pieces.push((nalu, new_piece));
+            } else {
+                break;
+            }
+            next_piece_idx += 1;
+            start += 4;
+        }
+
+        if new_pieces.is_empty() {
+            return Ok(());
+        }
+
+        // the first nalu and piece should removed
+        self.nals.remove(0);
+        self.pieces.remove(0);
+        let offset = new_pieces.len() - 1;
+
+        // update pieces index
+        for nalu in &mut self.nals {
+            nalu.next_piece_idx += offset as u32;
+        }
+
+        for (nalu, piece) in new_pieces.into_iter().rev() {
+            self.nals.insert(0, nalu);
+            self.pieces.insert(0, Bytes::copy_from_slice(&piece));
+        }
+        Ok(())
+    }
+
     fn finalize_access_unit(&mut self, au: AccessUnit, reason: &str) -> Result<VideoFrame, String> {
         let mut piece_idx = 0;
         let mut retained_len = 0usize;
@@ -441,16 +515,20 @@ impl Depacketizer {
             self.log_access_unit(&au, reason);
         }
 
-        for nal in &self.nals {
-            match nal.hdr.nal_unit_type() {
-                UnitType::SeqParameterSet | UnitType::PicParameterSet => has_sps_pps = true,
-                UnitType::SliceLayerWithoutPartitioningIdr => has_idr = true,
-                _ => {}
+        self.split_combind_nalu()?;
+
+        if INSERT_PARAMETER {
+            for nal in &self.nals {
+                match nal.hdr.nal_unit_type() {
+                    UnitType::SeqParameterSet | UnitType::PicParameterSet => has_sps_pps = true,
+                    UnitType::SliceLayerWithoutPartitioningIdr => has_idr = true,
+                    _ => {}
+                }
             }
-        }
-        // idr need sps pps
-        if has_idr & !has_sps_pps && self.parameters.is_some() {
-            insert_sps_pps = true;
+            // idr need sps pps
+            if has_idr & !has_sps_pps && self.parameters.is_some() {
+                insert_sps_pps = true;
+            }
         }
 
         for nal in &self.nals {
@@ -1383,6 +1461,83 @@ mod tests {
               \x00\x00\x00\x06\x65slice"
         );
         assert_eq!(frame.timestamp, ts2); // use the timestamp from the video frame.
+    }
+
+    // depacketize with SPS PPS IDR combind within FU-A of NALU type SPS
+    #[test]
+    fn depacketize_sps_pps_idr_combind() {
+        init_logging();
+        let mut d = super::Depacketizer::new(90_000, Some("packetization-mode=1;profile-level-id=64001E;sprop-parameter-sets=Z2QAHqwsaoLA9puCgIKgAAADACAAAAMD0IAA,aO4xshsA")).unwrap();
+        let timestamp = crate::Timestamp {
+            timestamp: 0,
+            clock_rate: NonZeroU32::new(90_000).unwrap(),
+            start: 0,
+        };
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A packet, start.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 2,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x7c\x87\
+                    \x4d\x00\x16\x8d\x8d\x40\x50\x17\xfc\xb3\x70\x10\x10\x14\x00\x00\x1c\x20\x00\x05\x7e\x40\x10\
+                    \x00\x00\x00\x01\x68\
+                    \x68\xee\x3c\x80
+                    \x00\x00\x00\x01\x65idr start")
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(d.pull().is_none());
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A packet, middle.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 3,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build(*b"\x7c\x07fu-a middle, ")
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(d.pull().is_none());
+        d.push(
+            ReceivedPacketBuilder {
+                // FU-A packet, end.
+                ctx: crate::PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 4,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build(*b"\x7c\x47fu-a end")
+            .unwrap(),
+        )
+        .unwrap();
+        let frame = match d.pull() {
+            Some(CodecItem::VideoFrame(frame)) => frame,
+            _ => panic!(),
+        };
+        assert_eq!(
+            frame.data(),
+            b"\x00\x00\x00\x0a\x67sps start\
+                \x00\x00\x00\x0a\x68pps start\
+                \x00\x00\x00\x21\x65idr start, fu-a middle, fu-a end
+                \x00\x00\x00\x04\x01plain"
+        );
     }
 
     /// Test bad framing at a GOP boundary in a stream from a Reolink RLC-822A
