@@ -370,7 +370,7 @@ impl Depacketizer {
         }
         self.input_state = if mark {
             let last_nal_hdr = self.nals.last().unwrap().hdr;
-            if can_end_au(last_nal_hdr.nal_unit_type()) || self.should_fire() {
+            if can_end_au(last_nal_hdr.nal_unit_type()) || self.should_fire(&access_unit) {
                 access_unit.end_ctx = ctx;
                 self.pending = Some(self.finalize_access_unit(access_unit, "mark")?);
                 DepacketizerInputState::PostMark { timestamp, loss: 0 }
@@ -431,24 +431,21 @@ impl Depacketizer {
     }
 
     /// if this is SPS PPS and [START_CODE] was found in
-    fn should_fire(&mut self) -> bool {
+    fn should_fire(&mut self, au: &AccessUnit) -> bool {
+        // still in fu_a
+        if au.in_fu_a {
+            return false;
+        }
         let last = self.nals.last().unwrap();
         match last.hdr.nal_unit_type() {
             UnitType::SeqParameterSet | UnitType::PicParameterSet => {}
             _ => return false,
         }
         let piece = &self.pieces[0][..];
-        if piece
+        piece
             .windows(START_CODE.len())
             .position(|window| window == START_CODE)
             .is_some()
-        {
-            println!("found start code");
-            true
-        } else {
-            println!("not found start code");
-            false
-        }
     }
 
     /// sometimes SPS-PPS was insert before IDR, and the nalu is marked as SPS
@@ -467,23 +464,46 @@ impl Depacketizer {
                 .windows(START_CODE.len())
                 .position(|window| window == START_CODE)
             {
-                debug!("found AnnexB start code");
+                debug!("found AnnexB start code, start: {start}, pos: {pos}");
                 // save current nalu, and copy to a new Bytes
                 let mut new_piece: Vec<u8> = Vec::new();
-                new_piece.extend_from_slice(&haystack[..pos]);
-                let hdr = NalHeader::new(haystack[0])
-                    .map_err(|_| format!("bad header {:02x} in STAP-A", haystack[0]))?;
+                if start == 0 {
+                    new_piece.extend_from_slice(&haystack[..pos]);
+                } else {
+                    new_piece.extend_from_slice(&haystack[1..pos]);
+                }
+
+                // for the first, we have already got hdr
+                let hdr = if start == 0 {
+                    self.nals[0].hdr.to_owned()
+                } else {
+                    NalHeader::new(haystack[0])
+                        .map_err(|_| format!("bad header {:02x} in SPS/PPS", haystack[0]))?
+                };
                 let nalu = Nal {
                     hdr,
                     next_piece_idx,
-                    len: pos as u32,
+                    len: if start == 0 { pos + 1 } else { pos } as u32,
                 };
                 new_pieces.push((nalu, new_piece));
+                start += pos + 4;
+                next_piece_idx += 1;
+            } else if start != 0 {
+                // the last one
+                let mut new_piece: Vec<u8> = Vec::new();
+                new_piece.extend_from_slice(&haystack[1..]);
+                let hdr = NalHeader::new(haystack[0])
+                    .map_err(|_| format!("bad header {:02x} in SPS/PPS", haystack[0]))?;
+                let nalu = Nal {
+                    hdr,
+                    next_piece_idx: self.nals[0].next_piece_idx + next_piece_idx - 1,
+                    len: self.nals[0].len - start as u32 - 1,
+                };
+                new_pieces.push((nalu, new_piece));
+                break;
             } else {
                 break;
             }
-            next_piece_idx += 1;
-            start += 4;
         }
 
         if new_pieces.is_empty() {
@@ -1492,11 +1512,7 @@ mod tests {
                 mark: false,
                 payload_type: 0,
             }
-            .build(*b"\x7c\x87\
-                    \x4d\x00\x16\x8d\x8d\x40\x50\x17\xfc\xb3\x70\x10\x10\x14\x00\x00\x1c\x20\x00\x05\x7e\x40\x10\
-                    \x00\x00\x00\x01\
-                    \x68\xee\x3c\x80
-                    \x00\x00\x00\x01\x65idr start")
+            .build(*b"\x7c\x87\x4d\x00\x16\x8d\x8d\x40\x50\x17\xfc\xb3\x70\x10\x10\x14\x00\x00\x1c\x20\x00\x05\x7e\x40\x10\x00\x00\x00\x01\x68\xee\x3c\x80\x00\x00\x00\x01\x65idr start, ")
             .unwrap(),
         )
         .unwrap();
@@ -1540,8 +1556,8 @@ mod tests {
         };
         assert_eq!(
             frame.data(),
-            b"\x67\x4d\x00\x16\x8d\x8d\x40\x50\x17\xfc\xb3\x70\x10\x10\x14\x00\x00\x1c\x20\x00\x05\x7e\x40\x10\
-              \x68\xee\x3c\x80\
+            b"\x00\x00\x00\x18\x67\x4d\x00\x16\x8d\x8d\x40\x50\x17\xfc\xb3\x70\x10\x10\x14\x00\x00\x1c\x20\x00\x05\x7e\x40\x10\
+              \x00\x00\x00\x04\x68\xee\x3c\x80\
               \x00\x00\x00\x21\x65idr start, fu-a middle, fu-a end"
         );
     }
