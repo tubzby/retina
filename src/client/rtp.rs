@@ -251,7 +251,14 @@ impl InorderParser {
         stream_id: usize,
         data: Bytes,
     ) -> Result<Option<PacketItem>, String> {
-        let first_pkt = crate::rtcp::ReceivedCompoundPacket::validate(&data[..])?;
+        // ignore error, some camera might sent skewed rtcp SDES, with extra 4 zeros.
+        let first_pkt = match crate::rtcp::ReceivedCompoundPacket::validate(&data[..]) {
+            Ok(v) => v,
+            Err(err) => {
+                debug!("rtcp not valid, {err:?}");
+                return Ok(None);
+            }
+        };
         let mut rtp_timestamp = None;
         if let Ok(Some(sr)) = first_pkt.as_sender_report() {
             rtp_timestamp = Some(timeline.place(sr.rtp_timestamp()).map_err(
