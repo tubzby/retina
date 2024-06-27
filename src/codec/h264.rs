@@ -19,7 +19,7 @@ use crate::{
 use super::VideoFrame;
 
 /// wheter we insert sps/pps before IDR
-const INSERT_PARAMETER: bool = false;
+const INSERT_PARAMETER: bool = true;
 const START_CODE: &[u8] = b"\x00\x00\x00\x01";
 
 /// A [super::Depacketizer] implementation which finds access unit boundaries
