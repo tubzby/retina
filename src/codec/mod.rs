@@ -187,6 +187,7 @@ impl AudioParameters {
 }
 
 /// An audio frame, which consists of one or more samples.
+#[derive(Clone)]
 pub struct AudioFrame {
     ctx: crate::PacketContext,
     stream_id: usize,
@@ -310,6 +311,7 @@ impl MessageFrame {
 ///
 /// Durations aren't specified here; they can be calculated from the timestamp of a following
 /// picture, or approximated via the frame rate.
+#[derive(Clone)]
 pub struct VideoFrame {
     // A pair of contexts: for the start and for the end.
     // Having both can be useful to measure the total time elapsed while receiving the frame.
