@@ -7,14 +7,101 @@
 //! codec, as needed for a client during `PLAY` and a server during `RECORD`.
 //! Packetization (needed for the reverse) may be added in the future.
 
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
+use std::num::NonZeroU8;
 use std::num::{NonZeroU16, NonZeroU32};
 
 use bytes::Bytes;
 
+use crate::error::ErrorInt;
 use crate::rtp::ReceivedPacket;
 use crate::ConnectionContext;
 use crate::Error;
 use crate::StreamContext;
+
+/// Writes an `.mp4` (more properly, ISO/IEC 14496-12 BMFF) box.
+///
+/// See ISO/IEC 14496-12 section 4.2. This macro reserves space for the
+/// compact/32-bit size, writes the compact/32-bit type (specified in `fourcc`),
+/// runs the supplied block `b` which is expected to fill the contents, and then
+/// sets the length accordingly.
+macro_rules! write_mp4_box {
+    ($buf:expr, $fourcc:expr, $b:block) => {{
+        let _: &mut Vec<u8> = $buf; // type-check.
+        let pos_start = $buf.len();
+        let fourcc: [u8; 4] = $fourcc;
+        $buf.extend_from_slice(&[0, 0, 0, 0, fourcc[0], fourcc[1], fourcc[2], fourcc[3]]);
+        let r = {
+            $b;
+        };
+        let pos_end = $buf.len();
+        let len = pos_end
+            .checked_sub(pos_start)
+            .expect("buf should not shrink during `write_mp4_box` block");
+        let len = u32::try_from(len).expect("box size should not exceed u32::MAX");
+        $buf[pos_start..pos_start + 4].copy_from_slice(&len.to_be_bytes()[..]);
+        r
+    }};
+}
+
+/// Overwrites a buffer with a varint length, returning the length of the length.
+/// See ISO/IEC 14496-1 section 8.3.3.
+fn set_iso14496_length(len: usize, data: &mut [u8]) -> usize {
+    if len < 1 << 7 {
+        data[0] = len as u8;
+        1
+    } else if len < 1 << 14 {
+        data[0] = ((len & 0x7F) | 0x80) as u8;
+        data[1] = (len >> 7) as u8;
+        2
+    } else if len < 1 << 21 {
+        data[0] = ((len & 0x7F) | 0x80) as u8;
+        data[1] = (((len >> 7) & 0x7F) | 0x80) as u8;
+        data[2] = (len >> 14) as u8;
+        3
+    } else if len < 1 << 28 {
+        data[0] = ((len & 0x7F) | 0x80) as u8;
+        data[1] = (((len >> 7) & 0x7F) | 0x80) as u8;
+        data[2] = (((len >> 14) & 0x7F) | 0x80) as u8;
+        data[3] = (len >> 21) as u8;
+        4
+    } else {
+        // BaseDescriptor sets a maximum length of 2**28 - 1.
+        panic!("ISO 14496 descriptor should not exceed maximum length of 2**28 - 1")
+    }
+}
+
+/// Writes a descriptor tag and length for everything appended in the supplied
+/// scope. See ISO/IEC 14496-1 Table 1 for the `tag`.
+macro_rules! write_mpeg4_descriptor {
+    ($buf:expr, $tag:expr, $b:block) => {{
+        let _: &mut Vec<u8> = $buf; // type-check.
+        let _: u8 = $tag;
+        let pos_start = $buf.len();
+
+        // Overallocate room for the varint length and append the body.
+        $buf.extend_from_slice(&[$tag, 0, 0, 0, 0]);
+        let r = {
+            $b;
+        };
+        let pos_end = $buf.len();
+
+        // Then fix it afterward: write the correct varint length and move
+        // the body backward. This approach seems better than requiring the
+        // caller to first prepare the body in a separate allocation (and
+        // awkward code ordering), or (as ffmpeg does) writing a "varint"
+        // which is padded with leading 0x80 bytes.
+        let len = pos_end
+            .checked_sub(pos_start + 5)
+            .expect("`buf` should not shrink during `write_iso14496_descriptor` block");
+        let len_len =
+            crate::codec::set_iso14496_length(len, &mut $buf[pos_start + 1..pos_start + 4]);
+        $buf.copy_within(pos_start + 5..pos_end, pos_start + 1 + len_len);
+        $buf.truncate(pos_end + len_len - 4);
+        r
+    }};
+}
 
 pub(crate) mod aac;
 pub(crate) mod g723;
@@ -65,11 +152,16 @@ pub enum ParametersRef<'a> {
 /// calls to [`crate::client::Stream::parameters`] will return the new value.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct VideoParameters {
-    pixel_dimensions: (u32, u32),
+    pixel_dimensions: (u16, u16),
     rfc6381_codec: String,
     pixel_aspect_ratio: Option<(u32, u32)>,
     frame_rate: Option<(u32, u32)>,
     extra_data: Bytes,
+
+    /// The codec, for internal use in sample entry construction.
+    ///
+    /// This is more straightforward than reparsing the RFC 6381 codec string.
+    codec: VideoParametersCodec,
 }
 
 impl VideoParameters {
@@ -80,9 +172,19 @@ impl VideoParameters {
         &self.rfc6381_codec
     }
 
+    /// Returns a builder for an `.mp4` `VideoSampleEntry` box (as defined in
+    /// ISO/IEC 14496-12).
+    pub fn mp4_sample_entry(&self) -> VideoSampleEntryBuilder {
+        VideoSampleEntryBuilder {
+            params: self,
+            aspect_ratio_override: None,
+        }
+    }
+
     /// Returns the overall dimensions of the video frame in pixels, as `(width, height)`.
     pub fn pixel_dimensions(&self) -> (u32, u32) {
-        self.pixel_dimensions
+        let (width, height) = self.pixel_dimensions;
+        (width.into(), height.into())
     }
 
     /// Returns the displayed size of a pixel, if known, as a dimensionless ratio `(h_spacing, v_spacing)`.
@@ -134,6 +236,92 @@ impl std::fmt::Debug for VideoParameters {
     }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+enum VideoParametersCodec {
+    H264,
+    Jpeg,
+}
+
+impl VideoParametersCodec {
+    fn visual_sample_entry_box_type(self) -> [u8; 4] {
+        match self {
+            VideoParametersCodec::H264 => *b"avc1",
+            VideoParametersCodec::Jpeg => *b"mp4v",
+        }
+    }
+}
+
+pub struct VideoSampleEntryBuilder<'p> {
+    params: &'p VideoParameters,
+    aspect_ratio_override: Option<(u16, u16)>,
+}
+
+impl VideoSampleEntryBuilder<'_> {
+    /// Overrides the codec-level pixel aspect ratio via a `pasp` box.
+    #[inline]
+    pub fn with_aspect_ratio(self, aspect_ratio: (u16, u16)) -> Self {
+        Self {
+            aspect_ratio_override: Some(aspect_ratio),
+            ..self
+        }
+    }
+
+    /// Builds the `.mp4` `VisualSampleEntry` box, if possible.
+    pub fn build(self) -> Result<Vec<u8>, Error> {
+        let mut buf = Vec::new();
+        write_mp4_box!(
+            &mut buf,
+            self.params.codec.visual_sample_entry_box_type(),
+            {
+                // SampleEntry, section 8.5.2.2.
+                buf.extend_from_slice(&0u32.to_be_bytes()[..]); // pre_defined + reserved
+                buf.extend_from_slice(&1u32.to_be_bytes()[..]); // data_reference_index = 1
+
+                // VisualSampleEntry, section 12.1.3.2.
+                buf.extend_from_slice(&[0; 16]);
+                buf.extend_from_slice(&self.params.pixel_dimensions.0.to_be_bytes()[..]);
+                buf.extend_from_slice(&self.params.pixel_dimensions.1.to_be_bytes()[..]);
+                buf.extend_from_slice(&[
+                    0x00, 0x48, 0x00, 0x00, // horizresolution
+                    0x00, 0x48, 0x00, 0x00, // vertresolution
+                    0x00, 0x00, 0x00, 0x00, // reserved
+                    0x00, 0x01, // frame count
+                    0x00, 0x00, 0x00, 0x00, // compressorname
+                    0x00, 0x00, 0x00, 0x00, //
+                    0x00, 0x00, 0x00, 0x00, //
+                    0x00, 0x00, 0x00, 0x00, //
+                    0x00, 0x00, 0x00, 0x00, //
+                    0x00, 0x00, 0x00, 0x00, //
+                    0x00, 0x00, 0x00, 0x00, //
+                    0x00, 0x00, 0x00, 0x00, //
+                    0x00, 0x18, 0xff, 0xff, // depth + pre_defined
+                ]);
+
+                // Codec-specific portion.
+                match self.params.codec {
+                    VideoParametersCodec::H264 => {
+                        write_mp4_box!(&mut buf, *b"avcC", {
+                            buf.extend_from_slice(&self.params.extra_data);
+                        });
+                    }
+                    VideoParametersCodec::Jpeg => {
+                        jpeg::append_esds(&mut buf);
+                    }
+                }
+
+                // pasp box, if requested.
+                if let Some(aspect_ratio) = self.aspect_ratio_override {
+                    write_mp4_box!(&mut buf, *b"pasp", {
+                        buf.extend_from_slice(&u32::from(aspect_ratio.0).to_be_bytes()[..]);
+                        buf.extend_from_slice(&u32::from(aspect_ratio.1).to_be_bytes()[..]);
+                    });
+                }
+            }
+        );
+        Ok(buf)
+    }
+}
+
 /// Parameters which describe an audio stream.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct AudioParameters {
@@ -141,7 +329,7 @@ pub struct AudioParameters {
     frame_length: Option<NonZeroU32>,
     clock_rate: u32,
     extra_data: Vec<u8>,
-    sample_entry: Option<Vec<u8>>,
+    codec: AudioParametersCodec,
 }
 
 impl std::fmt::Debug for AudioParameters {
@@ -177,12 +365,41 @@ impl AudioParameters {
         &self.extra_data
     }
 
-    /// An `.mp4` `SimpleAudioEntry` box (as defined in ISO/IEC 14496-12), if possible.
+    /// Returns a builder for an `.mp4` `AudioSampleEntry` box (as defined in ISO/IEC 14496-12).
+    pub fn mp4_sample_entry(&self) -> AudioSampleEntryBuilder {
+        AudioSampleEntryBuilder { params: self }
+    }
+}
+
+/// Holds codec-specific data needed from the `AudioParameters`.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum AudioParametersCodec {
+    Aac { channels_config_id: NonZeroU8 },
+    Other,
+}
+
+pub struct AudioSampleEntryBuilder<'p> {
+    params: &'p AudioParameters,
+}
+
+impl AudioSampleEntryBuilder<'_> {
+    /// Builds the `.mp4` `AudioSampleEntry` box, if possible.
     ///
     /// Not all codecs can be placed into a `.mp4` file, and even for supported codecs there
     /// may be unsupported edge cases.
-    pub fn sample_entry(&self) -> Option<&[u8]> {
-        self.sample_entry.as_deref()
+    pub fn build(self) -> Result<Vec<u8>, Error> {
+        match self.params.codec {
+            AudioParametersCodec::Aac { channels_config_id } => aac::make_sample_entry(
+                channels_config_id,
+                self.params.clock_rate,
+                &self.params.extra_data,
+            ),
+            AudioParametersCodec::Other => {
+                bail!(ErrorInt::Unsupported(
+                    "unsupported audio codec for mp4".to_owned()
+                ));
+            }
+        }
     }
 }
 

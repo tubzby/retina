@@ -382,7 +382,14 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
                             buf.put_u32(0); // version
                             buf.put_u32(u32::try_from(self.video_params.len())?); // entry_count
                             for p in &self.video_params {
-                                self.write_video_sample_entry(buf, p)?;
+                                let e = p.mp4_sample_entry().build().map_err(|e| {
+                                    anyhow!(
+                                        "unable to produce VisualSampleEntry for {} stream: {}",
+                                        p.rfc6381_codec(),
+                                        e,
+                                    )
+                                })?;
+                                buf.extend_from_slice(&e);
                             }
                         });
                         self.video_trak.write_common_stbl_parts(buf)?;
@@ -466,8 +473,9 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
                             buf.put_u32(0); // version
                             buf.put_u32(1); // entry_count
                             buf.extend_from_slice(
-                                parameters
-                                    .sample_entry()
+                                &parameters
+                                    .mp4_sample_entry()
+                                    .build()
                                     .expect("all added streams have sample entries"),
                             );
                         });
@@ -494,40 +502,6 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
                         });
                     });
                 });
-            });
-        });
-        Ok(())
-    }
-
-    fn write_video_sample_entry(
-        &self,
-        buf: &mut BytesMut,
-        parameters: &VideoParameters,
-    ) -> Result<(), Error> {
-        // TODO: this should move to client::VideoParameters::sample_entry() or some such.
-        write_box!(buf, b"avc1", {
-            buf.put_u32(0);
-            buf.put_u32(1); // data_reference_index = 1
-            buf.extend_from_slice(&[0; 16]);
-            buf.put_u16(u16::try_from(parameters.pixel_dimensions().0)?);
-            buf.put_u16(u16::try_from(parameters.pixel_dimensions().1)?);
-            buf.extend_from_slice(&[
-                0x00, 0x48, 0x00, 0x00, // horizresolution
-                0x00, 0x48, 0x00, 0x00, // vertresolution
-                0x00, 0x00, 0x00, 0x00, // reserved
-                0x00, 0x01, // frame count
-                0x00, 0x00, 0x00, 0x00, // compressorname
-                0x00, 0x00, 0x00, 0x00, //
-                0x00, 0x00, 0x00, 0x00, //
-                0x00, 0x00, 0x00, 0x00, //
-                0x00, 0x00, 0x00, 0x00, //
-                0x00, 0x00, 0x00, 0x00, //
-                0x00, 0x00, 0x00, 0x00, //
-                0x00, 0x00, 0x00, 0x00, //
-                0x00, 0x18, 0xff, 0xff, // depth + pre_defined
-            ]);
-            write_box!(buf, b"avcC", {
-                buf.extend_from_slice(parameters.extra_data());
             });
         });
         Ok(())
@@ -737,7 +711,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     let video_stream_i = if !opts.no_video {
         let s = session.streams().iter().position(|s| {
             if s.media() == "video" {
-                if s.encoding_name() == "h264" {
+                if s.encoding_name() == "h264" || s.encoding_name() == "jpeg" {
                     log::info!("Using h264 video stream");
                     return true;
                 }
@@ -769,7 +743,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
             .find_map(|(i, s)| match s.parameters() {
                 // Only consider audio streams that can produce a .mp4 sample
                 // entry.
-                Some(retina::codec::ParametersRef::Audio(a)) if a.sample_entry().is_some() => {
+                Some(retina::codec::ParametersRef::Audio(a)) if a.mp4_sample_entry().build().is_ok() => {
                     log::info!("Using {} audio stream (rfc 6381 codec {})", s.encoding_name(), a.rfc6381_codec().unwrap());
                     Some((i, Box::new(a.clone())))
                 }

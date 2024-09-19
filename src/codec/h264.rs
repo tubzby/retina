@@ -923,6 +923,16 @@ impl InternalParameters {
         let pixel_dimensions = sps
             .pixel_dimensions()
             .map_err(|e| format!("SPS has invalid pixel dimensions: {e:?}"))?;
+        let e = |_| {
+            format!(
+                "SPS has invalid pixel dimensions: {}x{} is too large",
+                pixel_dimensions.0, pixel_dimensions.1
+            )
+        };
+        let pixel_dimensions = (
+            u16::try_from(pixel_dimensions.0).map_err(e)?,
+            u16::try_from(pixel_dimensions.1).map_err(e)?,
+        );
 
         // Create the AVCDecoderConfiguration, ISO/IEC 14496-15 section 5.2.4.1.
         // The beginning of the AVCDecoderConfiguration takes a few values from
@@ -991,6 +1001,7 @@ impl InternalParameters {
                 pixel_aspect_ratio,
                 frame_rate,
                 extra_data: avc_decoder_config,
+                codec: super::VideoParametersCodec::H264,
             },
             sps_nal,
             pps_nal,
