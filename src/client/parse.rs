@@ -684,7 +684,7 @@ pub(crate) fn parse_play(
                     Err(_) => warn!("Unparseable rtptime in RTP-Info header {:?}", rtp_info),
                 },
                 "ssrc" => {
-                    let ssrc = u32::from_str_radix(value, 16)
+                    let ssrc = u32::from_str_radix(value.trim_start(), 16)
                         .map_err(|_| format!("Unparseable ssrc {value}"))?;
                     state.ssrc = Some(ssrc);
                 }
