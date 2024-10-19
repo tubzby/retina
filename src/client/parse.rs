@@ -685,7 +685,7 @@ pub(crate) fn parse_play(
                 },
                 "ssrc" => {
                     let ssrc = u32::from_str_radix(value.trim_start(), 16)
-                        .map_err(|_| format!("Unparseable ssrc {value}"))?;
+                        .map_err(|_| format!("Unparseable ssrc {:x?}", value.as_bytes()))?;
                     state.ssrc = Some(ssrc);
                 }
                 _ => {}
