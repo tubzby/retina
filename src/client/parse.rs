@@ -575,7 +575,8 @@ pub(crate) fn parse_setup(response: &rtsp_types::Response<Bytes>) -> Result<Setu
     let mut server_port = None;
     for part in transport.as_str().split(';') {
         if let Some(v) = part.strip_prefix("ssrc=") {
-            let v = u32::from_str_radix(v, 16).map_err(|_| format!("Unparseable ssrc {v}"))?;
+            let v = u32::from_str_radix(v.trim_start(), 16)
+                .map_err(|_| format!("Unparseable ssrc {:x?}", v.as_bytes()))?;
             ssrc = Some(v);
             break;
         } else if let Some(interleaved) = part.strip_prefix("interleaved=") {
