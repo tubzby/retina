@@ -165,20 +165,11 @@ impl InorderParser {
         let ssrc = raw.ssrc();
         let loss =
             sequence_number.wrapping_sub(self.seq.map(|s| s.next).unwrap_or(sequence_number));
-        if matches!(self.ssrc, Some(s) if s.ssrc != ssrc) {
-            note_stale_live555_data_if_tcp(tool, session_options, conn_ctx, stream_ctx, pkt_ctx);
-            bail!(ErrorInt::RtpPacketError {
-                conn_ctx: *conn_ctx,
-                pkt_ctx: *pkt_ctx,
-                stream_ctx: stream_ctx.to_owned(),
-                stream_id,
-                ssrc,
-                sequence_number,
-                description: format!(
-                    "wrong ssrc after {} RTP pkts + {} RTCP pkts; expecting ssrc={:?} seq={:?}",
-                    self.seen_rtp_packets, self.seen_rtcp_packets, self.ssrc, self.seq,
-                ),
-            });
+        if let Some(s) = &mut self.ssrc {
+            if s.ssrc != ssrc {
+                debug!("update ssrc from: {:?} to: {:?}", s.ssrc, ssrc);
+                s.ssrc = ssrc;
+            }
         } else if self.ssrc.is_none() {
             self.ssrc = Some(Ssrc {
                 init: InitialExpectation::RtpPacket,
