@@ -578,7 +578,6 @@ pub(crate) fn parse_setup(response: &rtsp_types::Response<Bytes>) -> Result<Setu
             let v = u32::from_str_radix(v.trim_start(), 16)
                 .map_err(|_| format!("Unparseable ssrc {:x?}", v.as_bytes()))?;
             ssrc = Some(v);
-            break;
         } else if let Some(interleaved) = part.strip_prefix("interleaved=") {
             let mut channels = interleaved.splitn(2, '-');
             let n = channels.next().expect("splitn returns at least one part");
