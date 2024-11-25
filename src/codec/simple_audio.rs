@@ -24,7 +24,7 @@ impl Depacketizer {
                 frame_length: None, // variable
                 clock_rate,
                 extra_data: Vec::new(),
-                codec: super::AudioParametersCodec::Other,
+                sample_entry: None,
             },
             bits_per_sample,
             pending: None,
@@ -71,3 +71,4 @@ impl Depacketizer {
         self.pending.take().map(CodecItem::AudioFrame)
     }
 }
+

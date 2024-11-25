@@ -347,12 +347,13 @@ impl Depacketizer {
                             .nals
                             .last_mut()
                             .ok_or("nals non-empty while in fu".to_string())?;
-                        if hdr != nal.hdr {
-                            return Err(format!(
-                                "FU has inconsistent NAL type: {:?} then {:?}",
-                                nal.hdr, hdr,
-                            ));
-                        }
+                        // happens with HikiVision cameras
+                        //if hdr != nal.hdr {
+                        //    return Err(format!(
+                        //        "FU has inconsistent NAL type: {:?} then {:?}",
+                        //        nal.hdr, hdr,
+                        //    ));
+                        //}
                         nal.len += u32_len;
                         if end {
                             nal.next_piece_idx = pieces;
@@ -766,7 +767,7 @@ impl InternalParameters {
                 pixel_aspect_ratio,
                 frame_rate,
                 extra_data: hevc_decoder_config.record,
-                codec: super::VideoCodec::H265,
+                codec: super::VideoParametersCodec::H265,
             },
             vps_nal: hevc_decoder_config.vps,
             sps_nal: hevc_decoder_config.sps,

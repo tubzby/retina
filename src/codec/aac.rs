@@ -19,7 +19,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use std::{
     convert::TryFrom,
     fmt::Debug,
-    num::{NonZeroU16, NonZeroU32, NonZeroU8},
+    num::{NonZeroU16, NonZeroU32},
 };
 
 use crate::{error::ErrorInt, rtp::ReceivedPacket, ConnectionContext, Error, StreamContext};
@@ -106,15 +106,16 @@ impl AudioSpecificConfig {
                 .map_err(|e| format!("unable to read sampling_frequency ext: {e}"))?,
             0x10..=0xff => unreachable!(),
         };
-        let channels_config_id = r
-            .read::<u8>(4)
-            .map_err(|e| format!("unable to read channels: {e}"))?;
-        let channels = CHANNEL_CONFIGS
-            .get(usize::from(channels_config_id))
-            .ok_or_else(|| format!("reserved channelConfiguration 0x{channels_config_id:x}"))?
-            .as_ref()
-            .ok_or_else(|| "program_config_element parsing unimplemented".to_string())?;
-        let channels_config_id = NonZeroU8::new(channels_config_id).expect("non-zero");
+        let channels = {
+            let c = r
+                .read::<u8>(4)
+                .map_err(|e| format!("unable to read channels: {e}"))?;
+            CHANNEL_CONFIGS
+                .get(usize::from(c))
+                .ok_or_else(|| format!("reserved channelConfiguration 0x{c:x}"))?
+                .as_ref()
+                .ok_or_else(|| "program_config_element parsing unimplemented".to_string())?
+        };
         if audio_object_type == 5 || audio_object_type == 29 {
             // extensionSamplingFrequencyIndex + extensionSamplingFrequency.
             if r.read::<u8>(4)
@@ -165,7 +166,7 @@ impl AudioSpecificConfig {
                 rfc6381_codec,
                 frame_length: Some(NonZeroU32::from(frame_length)),
                 extra_data: raw.to_owned(),
-                codec: super::AudioParametersCodec::Aac { channels_config_id },
+                sample_entry: Some(make_sample_entry(channels, sampling_frequency, raw)?),
             },
             frame_length,
             channels,
@@ -175,15 +176,11 @@ impl AudioSpecificConfig {
 
 /// Returns an MP4AudioSampleEntry (`mp4a`) box as in ISO/IEC 14496-14 section 5.6.1.
 /// `config` should be a raw AudioSpecificConfig.
-pub(super) fn make_sample_entry(
-    channel_config_i: NonZeroU8,
+fn make_sample_entry(
+    channels: &ChannelConfig,
     sampling_frequency: u32,
     config: &[u8],
-) -> Result<Vec<u8>, Error> {
-    let channels = CHANNEL_CONFIGS
-        .get(usize::from(channel_config_i.get()))
-        .and_then(Option::as_ref)
-        .expect("channel_config_i should be valid");
+) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
 
     // Write an MP4AudioSampleEntry (`mp4a`), as in ISO/IEC 14496-14 section 5.6.1.
@@ -207,11 +204,8 @@ pub(super) fn make_sample_entry(
         // use a SamplingRateBox. The latter also requires changing the
         // version/structure of the AudioSampleEntryBox and the version of the
         // stsd box. Just support the former for now.
-        let Ok(sampling_frequency) = u16::try_from(sampling_frequency) else {
-            bail!(ErrorInt::Unsupported(format!(
-                "aac sampling_frequency={sampling_frequency} requires a SamplingRateBox"
-            )));
-        };
+        let sampling_frequency = u16::try_from(sampling_frequency)
+            .map_err(|_| format!("aac sampling_frequency={sampling_frequency} unsupported"))?;
         buf.put_u32(u32::from(sampling_frequency) << 16);
 
         // Write the embedded ESDBox (`esds`), as in ISO/IEC 14496-14 section 5.6.1.
@@ -1306,3 +1300,4 @@ mod tests {
         );
     }
 }
+
