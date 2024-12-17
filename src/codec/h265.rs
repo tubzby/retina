@@ -15,11 +15,16 @@ use std::fmt::Write;
 use base64::Engine as _;
 use bytes::{Buf, Bytes};
 use log::{debug, log_enabled, trace};
+use nal::UnitType;
 
 use crate::codec::h26x::TolerantBitReader;
 use crate::rtp::ReceivedPacket;
 
 use super::VideoFrame;
+
+/// wheter we insert sps/pps before IDR
+const INSERT_PARAMETER: bool = true;
+const START_CODE: &[u8] = b"\x00\x00\x00\x01";
 
 /// A [super::Depacketizer] implementation which finds access unit boundaries
 /// and produces unfragmented NAL units as specified in [RFC
@@ -458,9 +463,28 @@ impl Depacketizer {
         let mut new_sps = None::<Bytes>;
         let mut new_pps = None::<Bytes>;
 
+        let mut insert_meta = false;
+        let mut has_idr = false;
+        let mut has_meta = false;
+
         if log_enabled!(log::Level::Debug) {
             self.log_access_unit(&au, reason);
         }
+
+        if INSERT_PARAMETER {
+            for nal in &self.nals {
+                match nal.hdr.unit_type() {
+                    UnitType::VpsNut | UnitType::SpsNut | UnitType::PpsNut => has_meta = true,
+                    UnitType::IdrWRadl => has_idr = true,
+                    _ => {}
+                }
+            }
+            // idr need sps pps
+            if has_idr & !has_meta && self.parameters.is_some() {
+                insert_meta = true;
+            }
+        }
+
         for nal in &self.nals {
             let next_piece_idx = usize::try_from(nal.next_piece_idx).expect("u32 fits in usize");
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
@@ -509,8 +533,32 @@ impl Depacketizer {
             retained_len += 4usize + usize::try_from(nal.len).expect("u32 fits in usize");
             piece_idx = next_piece_idx;
         }
+
+        // we only insert one header on the start
+        if insert_meta {
+            if let Some(param) = &self.parameters {
+                retained_len +=
+                    12 + param.vps_nal.len() + param.sps_nal.len() + param.pps_nal.len();
+            }
+        }
+
         let mut data = Vec::with_capacity(retained_len);
         piece_idx = 0;
+
+        if insert_meta {
+            if let Some(param) = &self.parameters {
+                let len = param.vps_nal.len() as u32;
+                data.extend_from_slice(&len.to_be_bytes()[..]);
+                data.extend_from_slice(&param.vps_nal);
+                let len = param.sps_nal.len() as u32;
+                data.extend_from_slice(&len.to_be_bytes()[..]);
+                data.extend_from_slice(&param.sps_nal);
+                let len = param.pps_nal.len() as u32;
+                data.extend_from_slice(&len.to_be_bytes()[..]);
+                data.extend_from_slice(&param.pps_nal);
+            }
+        }
+
         for nal in &self.nals {
             let next_piece_idx = usize::try_from(nal.next_piece_idx).expect("u32 fits in usize");
             let nal_pieces = &self.pieces[piece_idx..next_piece_idx];
