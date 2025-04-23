@@ -463,6 +463,9 @@ impl Depacketizer {
         let mut next_piece_idx = 1;
         loop {
             let haystack = &piece[start..];
+            if haystack.len() == 0 {
+                break;
+            }
             if let Some(pos) = haystack
                 .windows(START_CODE.len())
                 .position(|window| window == START_CODE)
