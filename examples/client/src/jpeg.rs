@@ -1,4 +1,4 @@
-// Copyright (C) 2023 Niclas Olmenius <niclas@voysys.se>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Proof-of-concept `.jpeg` writer.
@@ -7,7 +7,7 @@
 
 use std::{num::NonZeroU32, path::PathBuf, pin::Pin, sync::Arc};
 
-use anyhow::{anyhow, bail, Error};
+use anyhow::{Error, anyhow, bail};
 use clap::Parser;
 use futures::{Future, StreamExt};
 use log::info;
@@ -78,7 +78,7 @@ async fn write_jpeg(
             pkt = session.next() => {
                 match pkt.ok_or_else(|| anyhow!("EOF"))?? {
                     CodecItem::VideoFrame(f) => {
-                        let out_path = opts.out_dir.join(&format!("{frame_count:05}.jpeg"));
+                        let out_path = opts.out_dir.join(format!("{frame_count:05}.jpeg"));
                         std::fs::write(out_path, f.data())?;
 
                         frame_count += 1;

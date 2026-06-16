@@ -1,4 +1,4 @@
-// Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! ONVIF metadata streams.
@@ -9,6 +9,8 @@
 //! bit set end messages.
 
 use bytes::{Buf, BufMut, BytesMut};
+
+use crate::codec::DepacketizeError;
 
 use super::{CodecItem, MessageParameters};
 
@@ -51,20 +53,20 @@ impl Depacketizer {
         }
     }
 
-    pub(super) fn parameters(&self) -> Option<super::ParametersRef> {
+    pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
         Some(super::ParametersRef::Message(&self.parameters))
     }
 
     pub(super) fn push(&mut self, pkt: crate::rtp::ReceivedPacket) -> Result<(), String> {
-        if pkt.loss() > 0 {
-            if let State::InProgress(in_progress) = &self.state {
-                log::debug!(
-                    "Discarding {}-byte message prefix due to loss of {} RTP packets",
-                    in_progress.data.len(),
-                    pkt.loss(),
-                );
-                self.state = State::Idle;
-            }
+        if pkt.loss() > 0
+            && let State::InProgress(in_progress) = &self.state
+        {
+            log::debug!(
+                "Discarding {}-byte message prefix due to loss of {} RTP packets",
+                in_progress.data.len(),
+                pkt.loss(),
+            );
+            self.state = State::Idle;
         }
         let mut in_progress = match std::mem::replace(&mut self.state, State::Idle) {
             State::InProgress(in_progress) => {
@@ -115,9 +117,9 @@ impl Depacketizer {
         Ok(())
     }
 
-    pub(super) fn pull(&mut self) -> Option<CodecItem> {
+    pub(super) fn pull(&mut self) -> Option<Result<CodecItem, DepacketizeError>> {
         match std::mem::replace(&mut self.state, State::Idle) {
-            State::Ready(message) => Some(CodecItem::MessageFrame(message)),
+            State::Ready(message) => Some(Ok(CodecItem::MessageFrame(message))),
             s => {
                 self.state = s;
                 None

@@ -1,4 +1,4 @@
-// Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Proof-of-concept `.mp4` writer.
@@ -17,7 +17,7 @@
 //! https://github.com/scottlamb/moonfire-nvr/wiki/Standards-and-specifications
 //! https://standards.iso.org/ittf/PubliclyAvailableStandards/c068960_ISO_IEC_14496-12_2015.zip
 
-use anyhow::{anyhow, bail, Context, Error};
+use anyhow::{Context, Error, anyhow, bail};
 use bytes::{Buf, BufMut, BytesMut};
 use clap::Parser;
 use futures::{Future, StreamExt};
@@ -382,7 +382,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
                             buf.put_u32(0); // version
                             buf.put_u32(u32::try_from(self.video_params.len())?); // entry_count
                             for p in &self.video_params {
-                                let e = p.sample_entry().build().map_err(|e| {
+                                let e = p.mp4_sample_entry().build().map_err(|e| {
                                     anyhow!(
                                         "unable to produce VisualSampleEntry for {} stream: {}",
                                         p.rfc6381_codec(),
@@ -473,8 +473,9 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
                             buf.put_u32(0); // version
                             buf.put_u32(1); // entry_count
                             buf.extend_from_slice(
-                                parameters
-                                    .sample_entry()
+                                &parameters
+                                    .mp4_sample_entry()
+                                    .build()
                                     .expect("all added streams have sample entries"),
                             );
                         });
@@ -488,7 +489,7 @@ impl<W: AsyncWrite + AsyncSeek + Send + Unpin> Mp4Writer<W> {
                             buf.put_u32(0); // version
                             buf.extend_from_slice(b"roll"); // grouping type
                             buf.put_u32(1); // entry_count
-                                            // BMFF section 10.1: AudioRollRecoveryEntry
+                            // BMFF section 10.1: AudioRollRecoveryEntry
                             buf.put_i16(-1); // roll_distance
                         });
                         write_box!(buf, b"sbgp", {
@@ -732,7 +733,12 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     };
     if let Some(i) = video_stream_i {
         session
-            .setup(i, SetupOptions::default().transport(opts.transport.clone()))
+            .setup(
+                i,
+                SetupOptions::default()
+                    .transport(opts.transport.clone())
+                    .frame_format(retina::codec::FrameFormat::MP4),
+            )
             .await?;
     }
     let audio_stream = if !opts.no_audio {
@@ -743,7 +749,7 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
             .find_map(|(i, s)| match s.parameters() {
                 // Only consider audio streams that can produce a .mp4 sample
                 // entry.
-                Some(retina::codec::ParametersRef::Audio(a)) if a.sample_entry().is_some() => {
+                Some(retina::codec::ParametersRef::Audio(a)) if a.mp4_sample_entry().build().is_ok() => {
                     log::info!("Using {} audio stream (rfc 6381 codec {})", s.encoding_name(), a.rfc6381_codec().unwrap());
                     Some((i, Box::new(a.clone())))
                 }
@@ -763,7 +769,12 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     };
     if let Some((i, _)) = audio_stream {
         session
-            .setup(i, SetupOptions::default().transport(opts.transport.clone()))
+            .setup(
+                i,
+                SetupOptions::default()
+                    .transport(opts.transport.clone())
+                    .frame_format(retina::codec::FrameFormat::MP4),
+            )
             .await?;
     }
     if video_stream_i.is_none() && audio_stream.is_none() {
@@ -784,4 +795,3 @@ pub async fn run(opts: Opts) -> Result<(), Error> {
     }
     result
 }
-

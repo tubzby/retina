@@ -1,3 +1,126 @@
+## unreleased
+
+*   accept schemeless `Content-Base` header (e.g. `192.168.1.10:554/stream0/`
+    instead of `rtsp://192.168.1.10:554/stream0/`) as sent by some Anjvision
+    cameras. See
+    [moonfire-nvr#356](https://github.com/scottlamb/moonfire-nvr/issues/356).
+
+## `v0.4.19` (2026-03-13)
+
+*   support cameras which improperly set the RTP "MARK" bit on SEI data,
+    including the [LV-IP22IR40DVBL](https://skyboo.net/2017/07/how-to-hack-my-own-ip-camera/) sold by Ivel.
+    See [moonfire-nvr#352](https://github.com/scottlamb/moonfire-nvr/issues/352).
+
+## `v0.4.18` (2026-03-10)
+
+*   `retina::codec::FrameFormat`: support Annex B encoding
+    ([#44](https://github.com/scottlamb/retina/issues/44)), ADTS encoding,
+    and parameter set insertion control. This makes it easier to feed
+    frames directly to a decoder or muxer without munging them. It also
+    makes Retina's behavior more camera-agnostic: previously it would include
+    inline parameters or not based on what the camera choose; now it's
+    configurable via `frame_format`.
+*   use the `RUST_LOG` environment variable to control logging in the examples
+    and tests. (Formerly it used `MOONFIRE_LOG`, but Retina is not part of
+    Moonfire, and `RUST_LOG` is standard.) Document in `README.md`.
+    As requested in [#55](https://github.com/scottlamb/retina/issues/55).
+*   restructure the `webrtc-proxy` example to avoid causing the upstream
+    RTSP server's buffer to fill while waiting for the user to copy'n'paste
+    tokens in both directions. Fixes
+    [#80](https://github.com/scottlamb/retina/issues/80).
+*   add a new `webcodecs` example that decodes video frames using WebCodecs API.
+    This is the absolute lowest-latency way to watch RTSP streams from a browser!
+*   expose receive timestamps (both wall clock and monotonic/instant) in packet
+    contexts.
+*   expose coded as well as display pixel dimensions in `VideoParameters` to ease
+    construction of a WebCodecs `VideoDecoderConfiguration`.
+*   expose number of audio channels in `AudioParameters` to ease construction of
+    a WebCodecs `AudioDecoderConfig`.
+*   allow producing `VideoParameters` from H.264 SPS and PPS NALs.
+
+## `v0.4.17` (2026-02-17)
+
+*   trim whitespace in SSRC values from `Transport` and `RTP-Info` headers,
+    improving compatibility with some Hikvision cameras (e.g. iDS-2CD9396-BIS
+    and DS-2CD3641G2-IZS). Thanks to
+    [@myermukhanov](https://github.com/myermukhanov) in
+    [#128](https://github.com/scottlamb/retina/pull/128).
+*   ignore trailing semicolons in `RTP-Info` header parsing, improving compatibility
+    with Laureii cameras. Reported by [@ZXY595](https://github.com/ZXY595) in
+    [#117](https://github.com/scottlamb/retina/issues/117).
+*   H.265: fix bug in which `TrailN`s (unit type 0) were rejected as a single NAL.
+    This was noticeable with an Intel N100 encoder + ffmpeg + MediaMTX.
+    As reported by [@anti-social](https://github.com/anti-social) in
+    [#123](https://github.com/scottlamb/retina/issues/123).
+*   H.264 and H.265: allow empty fragments, which are useless but sent by some
+    cameras, as reported by [@nemosupremo](https://github.com/nemosupremo) in
+    [#115](https://github.com/scottlamb/retina/issues/115).
+
+## `v0.4.16` (2026-02-08)
+
+*   fix inverted logic in simple audio `frame_length()` that caused valid G.711
+    (PCMA/PCMU) audio streams to be rejected with "invalid length" errors.
+    Reported by [C-Format](https://github.com/C-Format) in
+    [#126](https://github.com/scottlamb/retina/issues/126).
+*   fix resuming depacketization (via `Demuxed::poll_next`) after an error. Previously this could
+    panic due to error paths not maintaining the invariants.
+    See [#122](https://github.com/scottlamb/retina/122).
+*   support `pps_scaling_list_data_present`, needed by some Reolink H.265 cameras.
+    See [#112](https://github.com/scottlamb/retina/issues/112) and
+    [#116](https://github.com/scottlamb/retina/issues/116).
+
+## `v0.4.15` (2025-10-10)
+
+*   fix parsing of the `Transport` when the `ssrc` parameter precedes other
+    parameters and of SDP when the `control` attribute precedes other attributes.
+    This improves compatibility with Luckfox's `rkip` server.
+    See [#120](https://github.com/scottlamb/retina/issues/120).
+
+## `v0.4.14` (2025-10-03)
+
+*   fix H.265 ProfileTierLevel parsing when `sps_max_sub_layers_minus1 > 0`.
+    This caused strange error messages because the SPS bitstream was
+    mis-positioned. Thanks to [nemosupremo](https://github.com/nemosupremo)!
+*   improve compatibility with some Tiandy cameras by warning rather than erroring
+    when H.264 FU-A and H.265 FU change NAL types within a fragmented access
+    unit. These cameras appear to never set the subsequent packets' NAL types correctly.
+    See [scottlamb/moonfire-nvr#344](https://github.com/scottlamb/moonfire-nvr/issues/344).
+*   update dependencies: `jiff` to 0.2 and `thiserror` to 2.0
+*   add an example that uses ffmpeg to decode frames
+*   update minimum Rust version to 1.85
+*   ignore the "reserved" bit in FU-A payload, improving camera compatibility
+
+## `v0.4.13` (2025-01-31)
+
+*   fix H.265 SPS parsing flaw that affected the Tenda CP3PRO camera.
+*   fix format of RTCP packet used for firewall hole punching.
+*   support H.265 SPSs which set  `st_ref_pic_set.inter_ref_pic_set_prediction_flag`,
+    including Xiaomi YI Pro 2K Home cameras running
+    <https://github.com/roleoroleo/yi-hack-Allwinner-v2> firmware.
+    Fixes [scottlamb/moonfire-nvr#333](https://github.com/scottlamb/moonfire-nvr/issues/333).
+*   fix RFC 6381 codec string generation to match a significant bug fix in
+    Technical Corrigendum 1 to ISO/IEC 14496-15:2014.
+
+## `v0.4.12` (2025-01-28)
+
+*   support H.265 ([#57](https://github.com/scottlamb/retina/issues/57)).
+*   fix `Connecting via TCP to known-broken RTSP server` log line on
+    connection to a non-broken server.
+
+## `v0.4.11` (2025-01-22)
+
+*   improve some error messages on bad H.264 `sprop-parameter-sets`
+*   interoperate with V380 cameras by interpreting Annex B sequences in RTP
+    payload contexts where single NALs are otherwise expected.
+    (Fixes [#68](https://github.com/scottlamb/retina/issues/68),
+    [[#108](https://github.com/scottlamb/retina/issues/108)]).
+*   interpret Annex B sequences in H.264 `sprop-parameter-sets` also, improving
+    interoperability with additional cameras. In particular, Retina now
+    understands these video parameters at `DESCRIBE` time, rather than delaying
+    until the first full video frame is received.
+*   update minimum Rust to 1.70.
+*   use [`jiff`](https://crates.io/crates/jiff) for date formatting.
+
 ## `v0.4.10` (2024-08-19)
 
 *   update `base64` dep to 0.22

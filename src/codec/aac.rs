@@ -1,4 +1,4 @@
-// Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! AAC (Advanced Audio Codec) depacketization.
@@ -16,13 +16,31 @@
 
 use bitstream_io::BitRead;
 use bytes::{BufMut, Bytes, BytesMut};
+
+/// How to frame AAC audio in output.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Framing {
+    /// Raw access units with `AudioSpecificConfig` as
+    /// [`AudioParameters::extra_data`](super::AudioParameters::extra_data). Default.
+    ///
+    /// Suitable for ISO BMFF / `.mp4` files and decoders that accept raw AAC
+    /// with out-of-band configuration.
+    #[default]
+    Raw,
+
+    /// ADTS-wrapped frames (ISO/IEC 13818-7 / ISO/IEC 14496-3).
+    ///
+    /// Each audio frame is prefixed with a 7-byte ADTS fixed+variable header.
+    /// This is self-describing, so `extra_data` is empty/unneeded.
+    Adts,
+}
 use std::{
     convert::TryFrom,
     fmt::Debug,
-    num::{NonZeroU16, NonZeroU32},
+    num::{NonZeroU8, NonZeroU16, NonZeroU32},
 };
 
-use crate::{error::ErrorInt, rtp::ReceivedPacket, ConnectionContext, Error, StreamContext};
+use crate::{Error, codec::DepacketizeError, error::ErrorInt, rtp::ReceivedPacket};
 
 use super::{AudioParameters, CodecItem};
 
@@ -35,16 +53,23 @@ struct AudioSpecificConfig {
 
     frame_length: NonZeroU16,
     channels: &'static ChannelConfig,
+
+    /// MPEG-4 audio object type (1-based), needed for ADTS header generation.
+    audio_object_type: u8,
+
+    /// 4-bit sampling frequency index as defined in ISO/IEC 14496-3 section 1.6.3.3.
+    /// Needed for ADTS header generation.
+    sampling_frequency_index: u8,
 }
 
 /// A channel configuration as in ISO/IEC 14496-3 Table 1.19.
 #[derive(Debug)]
 struct ChannelConfig {
-    channels: u16,
+    channels: NonZeroU16,
 
     /// The "number of considered channels" as defined in ISO/IEC 13818-7 Term
     /// 3.58. Roughly, non-subwoofer channels.
-    ncc: u16,
+    ncc: NonZeroU16,
 
     /// A human-friendly name for the channel configuration.
     // The name is used in tests and in the Debug output. Suppress dead code warning.
@@ -55,13 +80,13 @@ struct ChannelConfig {
 #[rustfmt::skip]
 const CHANNEL_CONFIGS: [Option<ChannelConfig>; 8] = [
     /* 0 */ None, // "defined in AOT related SpecificConfig"
-    /* 1 */ Some(ChannelConfig { channels: 1, ncc: 1, name: "mono" }),
-    /* 2 */ Some(ChannelConfig { channels: 2, ncc: 2, name: "stereo" }),
-    /* 3 */ Some(ChannelConfig { channels: 3, ncc: 3, name: "3.0" }),
-    /* 4 */ Some(ChannelConfig { channels: 4, ncc: 4, name: "4.0" }),
-    /* 5 */ Some(ChannelConfig { channels: 5, ncc: 5, name: "5.0" }),
-    /* 6 */ Some(ChannelConfig { channels: 6, ncc: 5, name: "5.1" }),
-    /* 7 */ Some(ChannelConfig { channels: 8, ncc: 7, name: "7.1" }),
+    /* 1 */ Some(ChannelConfig { channels: NonZeroU16::new(1).unwrap(), ncc: NonZeroU16::new(1).unwrap(), name: "mono" }),
+    /* 2 */ Some(ChannelConfig { channels: NonZeroU16::new(2).unwrap(), ncc: NonZeroU16::new(2).unwrap(), name: "stereo" }),
+    /* 3 */ Some(ChannelConfig { channels: NonZeroU16::new(3).unwrap(), ncc: NonZeroU16::new(3).unwrap(), name: "3.0" }),
+    /* 4 */ Some(ChannelConfig { channels: NonZeroU16::new(4).unwrap(), ncc: NonZeroU16::new(4).unwrap(), name: "4.0" }),
+    /* 5 */ Some(ChannelConfig { channels: NonZeroU16::new(5).unwrap(), ncc: NonZeroU16::new(5).unwrap(), name: "5.0" }),
+    /* 6 */ Some(ChannelConfig { channels: NonZeroU16::new(6).unwrap(), ncc: NonZeroU16::new(5).unwrap(), name: "5.1" }),
+    /* 7 */ Some(ChannelConfig { channels: NonZeroU16::new(8).unwrap(), ncc: NonZeroU16::new(7).unwrap(), name: "7.1" }),
 ];
 
 impl AudioSpecificConfig {
@@ -81,10 +106,10 @@ impl AudioSpecificConfig {
         };
 
         // ISO/IEC 14496-3 section 1.6.3.3.
-        let sampling_frequency = match r
+        let sampling_frequency_index = r
             .read::<u8>(4)
-            .map_err(|e| format!("unable to read sampling_frequency: {e}"))?
-        {
+            .map_err(|e| format!("unable to read sampling_frequency: {e}"))?;
+        let sampling_frequency = match sampling_frequency_index {
             0x0 => 96_000,
             0x1 => 88_200,
             0x2 => 64_000,
@@ -99,23 +124,22 @@ impl AudioSpecificConfig {
             0xb => 8_000,
             0xc => 7_350,
             v @ 0xd | v @ 0xe => {
-                return Err(format!("reserved sampling_frequency_index value 0x{v:x}"))
+                return Err(format!("reserved sampling_frequency_index value 0x{v:x}"));
             }
             0xf => r
                 .read::<u32>(24)
                 .map_err(|e| format!("unable to read sampling_frequency ext: {e}"))?,
             0x10..=0xff => unreachable!(),
         };
-        let channels = {
-            let c = r
-                .read::<u8>(4)
-                .map_err(|e| format!("unable to read channels: {e}"))?;
-            CHANNEL_CONFIGS
-                .get(usize::from(c))
-                .ok_or_else(|| format!("reserved channelConfiguration 0x{c:x}"))?
-                .as_ref()
-                .ok_or_else(|| "program_config_element parsing unimplemented".to_string())?
-        };
+        let channels_config_id = r
+            .read::<u8>(4)
+            .map_err(|e| format!("unable to read channels: {e}"))?;
+        let channels = CHANNEL_CONFIGS
+            .get(usize::from(channels_config_id))
+            .ok_or_else(|| format!("reserved channelConfiguration 0x{channels_config_id:x}"))?
+            .as_ref()
+            .ok_or_else(|| "program_config_element parsing unimplemented".to_string())?;
+        let channels_config_id = NonZeroU8::new(channels_config_id).expect("non-zero");
         if audio_object_type == 5 || audio_object_type == 29 {
             // extensionSamplingFrequencyIndex + extensionSamplingFrequency.
             if r.read::<u8>(4)
@@ -148,7 +172,7 @@ impl AudioSpecificConfig {
         let frame_length = match (audio_object_type, frame_length_flag) {
             (3 /* AAC SR */, false) => NonZeroU16::new(256).expect("non-zero"),
             (3 /* AAC SR */, true) => {
-                return Err("frame_length_flag must be false for AAC SSR".into())
+                return Err("frame_length_flag must be false for AAC SSR".into());
             }
             (23 /* ER AAC LD */, false) => NonZeroU16::new(512).expect("non-zero"),
             (23 /* ER AAC LD */, true) => NonZeroU16::new(480).expect("non-zero"),
@@ -165,22 +189,29 @@ impl AudioSpecificConfig {
                 clock_rate: sampling_frequency,
                 rfc6381_codec,
                 frame_length: Some(NonZeroU32::from(frame_length)),
+                channels: channels.channels,
                 extra_data: raw.to_owned(),
-                sample_entry: Some(make_sample_entry(channels, sampling_frequency, raw)?),
+                codec: super::AudioParametersCodec::Aac { channels_config_id },
             },
             frame_length,
             channels,
+            audio_object_type,
+            sampling_frequency_index,
         })
     }
 }
 
 /// Returns an MP4AudioSampleEntry (`mp4a`) box as in ISO/IEC 14496-14 section 5.6.1.
 /// `config` should be a raw AudioSpecificConfig.
-fn make_sample_entry(
-    channels: &ChannelConfig,
+pub(super) fn make_sample_entry(
+    channel_config_i: NonZeroU8,
     sampling_frequency: u32,
     config: &[u8],
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, Error> {
+    let channels = CHANNEL_CONFIGS
+        .get(usize::from(channel_config_i.get()))
+        .and_then(Option::as_ref)
+        .expect("channel_config_i should be valid");
     let mut buf = Vec::new();
 
     // Write an MP4AudioSampleEntry (`mp4a`), as in ISO/IEC 14496-14 section 5.6.1.
@@ -193,7 +224,7 @@ fn make_sample_entry(
             0, 0, 0, 0, // AudioSampleEntry.reserved
             0, 0, 0, 0, // AudioSampleEntry.reserved
         ]);
-        buf.put_u16(channels.channels);
+        buf.put_u16(channels.channels.get());
         buf.extend_from_slice(&[
             0x00, 0x10, // AudioSampleEntry.samplesize
             0x00, 0x00, 0x00, 0x00, // AudioSampleEntry.pre_defined, AudioSampleEntry.reserved
@@ -204,8 +235,11 @@ fn make_sample_entry(
         // use a SamplingRateBox. The latter also requires changing the
         // version/structure of the AudioSampleEntryBox and the version of the
         // stsd box. Just support the former for now.
-        let sampling_frequency = u16::try_from(sampling_frequency)
-            .map_err(|_| format!("aac sampling_frequency={sampling_frequency} unsupported"))?;
+        let Ok(sampling_frequency) = u16::try_from(sampling_frequency) else {
+            bail!(ErrorInt::Unsupported(format!(
+                "aac sampling_frequency={sampling_frequency} requires a SamplingRateBox"
+            )));
+        };
         buf.put_u32(u32::from(sampling_frequency) << 16);
 
         // Write the embedded ESDBox (`esds`), as in ISO/IEC 14496-14 section 5.6.1.
@@ -232,15 +266,16 @@ fn make_sample_entry(
                     // elementary stream in byte". ISO/IEC 13818-7 section
                     // 8.2.2.1 defines the total decoder input buffer size as
                     // 6144 bits per NCC.
-                    let buffer_size_bytes = (6144 / 8) * u32::from(channels.ncc);
+                    let buffer_size_bytes = (6144 / 8) * u32::from(channels.ncc.get());
                     debug_assert!(buffer_size_bytes <= 0xFF_FFFF);
 
                     // buffer_size_bytes as a 24-bit number
                     buf.put_u8((buffer_size_bytes >> 16) as u8);
                     buf.put_u16(buffer_size_bytes as u16);
 
-                    let max_bitrate =
-                        (6144 / 1024) * u32::from(channels.ncc) * u32::from(sampling_frequency);
+                    let max_bitrate = (6144 / 1024)
+                        * u32::from(channels.ncc.get())
+                        * u32::from(sampling_frequency);
                     buf.put_u32(max_bitrate);
 
                     // avg_bitrate. ISO/IEC 14496-1 section 7.2.6.6 says "for streams with
@@ -339,6 +374,11 @@ fn parse_format_specific_params(
 pub(crate) struct Depacketizer {
     config: AudioSpecificConfig,
     state: DepacketizerState,
+    framing: Framing,
+
+    /// The original `AudioSpecificConfig` bytes, preserved so that
+    /// `extra_data` can be restored if framing is switched back to `Raw`.
+    audio_specific_config: Vec<u8>,
 }
 
 /// [DepacketizerState] holding access units within a single RTP packet.
@@ -427,34 +467,88 @@ impl Depacketizer {
         let format_specific_params = format_specific_params
             .ok_or_else(|| "AAC requires format specific params".to_string())?;
         let config = parse_format_specific_params(clock_rate, format_specific_params)?;
-        if matches!(channels, Some(c) if c.get() != config.channels.channels) {
+        if matches!(channels, Some(c) if c != config.channels.channels) {
             return Err(format!(
                 "Expected RTP channels {:?} and AAC channels {:?} to match",
                 channels, config.channels
             ));
         }
+        let audio_specific_config = config.parameters.extra_data.clone();
         Ok(Self {
             config,
             state: DepacketizerState::default(),
+            framing: Framing::default(),
+            audio_specific_config,
         })
     }
 
-    pub(super) fn parameters(&self) -> Option<super::ParametersRef> {
+    pub(super) fn set_frame_format(&mut self, config: super::FrameFormat) {
+        self.framing = config.aac_framing;
+        match config.aac_framing {
+            Framing::Raw => {
+                // Restore AudioSpecificConfig as extra_data.
+                self.config
+                    .parameters
+                    .extra_data
+                    .clone_from(&self.audio_specific_config);
+            }
+            Framing::Adts => {
+                // Clear extra_data: a decoder receiving AudioSpecificConfig would
+                // expect raw AAC frames and misparse the ADTS-wrapped data.
+                self.config.parameters.extra_data.clear();
+            }
+        }
+    }
+
+    /// Builds a 7-byte ADTS fixed+variable header for the given frame size.
+    ///
+    /// See ISO/IEC 13818-7 section 6.2.
+    fn adts_header(&self, aac_frame_len: usize) -> [u8; 7] {
+        // ADTS profile is audio_object_type - 1.
+        let profile = self.config.audio_object_type - 1;
+        let freq_index = self.config.sampling_frequency_index;
+        let channel_config = match self.config.parameters.codec {
+            super::AudioParametersCodec::Aac { channels_config_id } => channels_config_id.get(),
+            _ => unreachable!(),
+        };
+        // ADTS frame length = header (7 bytes) + raw AAC frame data.
+        let adts_frame_len = (7 + aac_frame_len) as u16;
+        [
+            // Byte 0: syncword high 8 bits.
+            0xFF,
+            // Byte 1: syncword low 4 bits, ID=0 (MPEG-4), layer=00, protection_absent=1.
+            0xF1,
+            // Byte 2: profile (2 bits), sampling_freq_index (4 bits), private=0,
+            //   channel_config high bit (1 bit).
+            (profile << 6) | (freq_index << 2) | (channel_config >> 2),
+            // Byte 3: channel_config low 2 bits, originality=0, home=0,
+            //   copyright_id=0, copyright_start=0, frame_length high 2 bits.
+            ((channel_config & 0x3) << 6) | ((adts_frame_len >> 11) as u8),
+            // Byte 4: frame_length middle 8 bits.
+            (adts_frame_len >> 3) as u8,
+            // Byte 5: frame_length low 3 bits, buffer_fullness high 5 bits (0x7FF = VBR).
+            ((adts_frame_len & 0x7) << 5) as u8 | 0x1F,
+            // Byte 6: buffer_fullness low 6 bits (0x7FF = VBR), number_of_raw_data_blocks=0.
+            0xFC,
+        ]
+    }
+
+    pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
         Some(super::ParametersRef::Audio(&self.config.parameters))
     }
 
     pub(super) fn push(&mut self, pkt: ReceivedPacket) -> Result<(), String> {
-        if pkt.loss() > 0 {
-            if let DepacketizerState::Fragmented(ref mut f) = self.state {
-                log::debug!(
-                    "Discarding in-progress fragmented AAC frame due to loss of {} RTP packets.",
-                    pkt.loss(),
-                );
-                self.state = DepacketizerState::Idle {
-                    prev_loss: f.loss, // note this packet's loss will be added in later.
-                    loss_since_mark: true,
-                };
-            }
+        if pkt.loss() > 0
+            && let DepacketizerState::Fragmented(ref mut f) = self.state
+        {
+            log::debug!(
+                "Discarding in-progress fragmented AAC frame due to loss of {} RTP packets.",
+                pkt.loss(),
+            );
+            self.state = DepacketizerState::Idle {
+                prev_loss: f.loss, // note this packet's loss will be added in later.
+                loss_since_mark: true,
+            };
         }
 
         // Read the AU headers.
@@ -474,7 +568,7 @@ impl Depacketizer {
             return Err("packet too short for au-headers".to_string());
         }
         match &mut self.state {
-            DepacketizerState::Fragmented(ref mut frag) => {
+            DepacketizerState::Fragmented(frag) => {
                 if au_headers_count != 1 {
                     return Err(format!(
                         "Got {au_headers_count}-AU packet while fragment in progress"
@@ -554,19 +648,30 @@ impl Depacketizer {
         Ok(())
     }
 
-    pub(super) fn pull(
-        &mut self,
-        conn_ctx: &ConnectionContext,
-        stream_ctx: &StreamContext,
-    ) -> Result<Option<super::CodecItem>, Error> {
+    /// Wraps raw AAC frame data in an ADTS header if configured.
+    fn wrap_frame_data(&self, raw: Bytes) -> Bytes {
+        match self.framing {
+            Framing::Raw => raw,
+            Framing::Adts => {
+                let header = self.adts_header(raw.len());
+                let mut buf = BytesMut::with_capacity(header.len() + raw.len());
+                buf.extend_from_slice(&header);
+                buf.extend_from_slice(&raw);
+                buf.freeze()
+            }
+        }
+    }
+
+    pub(super) fn pull(&mut self) -> Option<Result<super::CodecItem, DepacketizeError>> {
         match std::mem::take(&mut self.state) {
             s @ DepacketizerState::Idle { .. } | s @ DepacketizerState::Fragmented(..) => {
                 self.state = s;
-                Ok(None)
+                None
             }
-            DepacketizerState::Ready(f) => {
+            DepacketizerState::Ready(mut f) => {
                 self.state = DepacketizerState::default();
-                Ok(Some(CodecItem::AudioFrame(f)))
+                f.data = self.wrap_frame_data(f.data);
+                Some(Ok(CodecItem::AudioFrame(f)))
             }
             DepacketizerState::Aggregated(mut agg) => {
                 let i = usize::from(agg.frame_i);
@@ -580,22 +685,22 @@ impl Depacketizer {
                     // indicate interleaving, which we don't support.
                     // TODO: https://datatracker.ietf.org/doc/html/rfc3640#section-3.3.6
                     // says "receivers MUST support de-interleaving".
-                    return Err(error(
-                        *conn_ctx,
-                        stream_ctx,
-                        agg,
-                        "interleaving not yet supported".to_owned(),
-                    ));
+                    return Some(Err(DepacketizeError {
+                        pkt_ctx: agg.pkt.ctx,
+                        ssrc: agg.pkt.ssrc(),
+                        sequence_number: agg.pkt.sequence_number(),
+                        description: "interleaving not yet supported".to_owned(),
+                    }));
                 }
                 if size > payload.len() - agg.data_off {
                     // start of fragment
                     if agg.frame_count != 1 {
-                        return Err(error(
-                            *conn_ctx,
-                            stream_ctx,
-                            agg,
-                            "fragmented AUs must not share packets".to_owned(),
-                        ));
+                        return Some(Err(DepacketizeError {
+                            pkt_ctx: agg.pkt.ctx,
+                            ssrc: agg.pkt.ssrc(),
+                            sequence_number: agg.pkt.sequence_number(),
+                            description: "fragmented AUs must not share packets".to_owned(),
+                        }));
                     }
                     if mark {
                         if agg.loss_since_mark {
@@ -607,14 +712,14 @@ impl Depacketizer {
                                 prev_loss: agg.loss,
                                 loss_since_mark: false,
                             };
-                            return Ok(None);
+                            return None;
                         }
-                        return Err(error(
-                            *conn_ctx,
-                            stream_ctx,
-                            agg,
-                            "mark can't be set on beginning of fragment".to_owned(),
-                        ));
+                        return Some(Err(DepacketizeError {
+                            pkt_ctx: agg.pkt.ctx,
+                            ssrc: agg.pkt.ssrc(),
+                            sequence_number: agg.pkt.sequence_number(),
+                            description: "mark can't be set on beginning of fragment".to_owned(),
+                        }));
                     }
                     let mut buf = BytesMut::with_capacity(size);
                     buf.extend_from_slice(&payload[agg.data_off..]);
@@ -625,15 +730,15 @@ impl Depacketizer {
                         size: size as u16,
                         buf,
                     });
-                    return Ok(None);
+                    return None;
                 }
                 if !mark {
-                    return Err(error(
-                        *conn_ctx,
-                        stream_ctx,
-                        agg,
-                        "mark must be set on non-fragmented au".to_owned(),
-                    ));
+                    return Some(Err(DepacketizeError {
+                        pkt_ctx: agg.pkt.ctx,
+                        ssrc: agg.pkt.ssrc(),
+                        sequence_number: agg.pkt.sequence_number(),
+                        description: "mark must be set on non-fragmented au".to_owned(),
+                    }));
                 }
 
                 let delta = u32::from(agg.frame_i) * u32::from(self.config.frame_length.get());
@@ -648,15 +753,19 @@ impl Depacketizer {
                     timestamp: match agg_timestamp.try_add(delta) {
                         Some(t) => t,
                         None => {
-                            return Err(error(
-                                *conn_ctx,
-                                stream_ctx,
-                                agg,
-                                format!("aggregate timestamp {agg_timestamp} + {delta} overflows"),
-                            ))
+                            return Some(Err(DepacketizeError {
+                                pkt_ctx: agg.pkt.ctx,
+                                ssrc: agg.pkt.ssrc(),
+                                sequence_number: agg.pkt.sequence_number(),
+                                description: format!(
+                                    "aggregate timestamp {agg_timestamp} + {delta} overflows"
+                                ),
+                            }));
                         }
                     },
-                    data: Bytes::copy_from_slice(&payload[agg.data_off..agg.data_off + size]),
+                    data: self.wrap_frame_data(Bytes::copy_from_slice(
+                        &payload[agg.data_off..agg.data_off + size],
+                    )),
                 };
                 agg.loss = 0;
                 agg.data_off += size;
@@ -664,32 +773,15 @@ impl Depacketizer {
                 if agg.frame_i < agg.frame_count {
                     self.state = DepacketizerState::Aggregated(agg);
                 }
-                Ok(Some(CodecItem::AudioFrame(frame)))
+                Some(Ok(CodecItem::AudioFrame(frame)))
             }
         }
     }
 }
 
-fn error(
-    conn_ctx: ConnectionContext,
-    stream_ctx: &StreamContext,
-    agg: Aggregate,
-    description: String,
-) -> Error {
-    Error(std::sync::Arc::new(ErrorInt::RtpPacketError {
-        conn_ctx,
-        stream_ctx: *stream_ctx,
-        pkt_ctx: *agg.pkt.ctx(),
-        stream_id: agg.pkt.stream_id(),
-        ssrc: agg.pkt.ssrc(),
-        sequence_number: agg.pkt.sequence_number(),
-        description,
-    }))
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::{rtp::ReceivedPacketBuilder, PacketContext};
+    use crate::{PacketContext, rtp::ReceivedPacketBuilder};
 
     use super::*;
 
@@ -746,19 +838,13 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let a = match d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-        {
-            Some(CodecItem::AudioFrame(a)) => a,
+        let a = match d.pull() {
+            Some(Ok(CodecItem::AudioFrame(a))) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.timestamp, timestamp);
         assert_eq!(&a.data[..], b"asdf");
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert_eq!(d.pull(), None);
 
         // Aggregate of 3 frames.
         d.push(
@@ -784,37 +870,25 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let a = match d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-        {
-            Some(CodecItem::AudioFrame(a)) => a,
+        let a = match d.pull() {
+            Some(Ok(CodecItem::AudioFrame(a))) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.timestamp, timestamp);
         assert_eq!(&a.data[..], b"foo");
-        let a = match d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-        {
-            Some(CodecItem::AudioFrame(a)) => a,
+        let a = match d.pull() {
+            Some(Ok(CodecItem::AudioFrame(a))) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.timestamp, timestamp.try_add(1_024).unwrap());
         assert_eq!(&a.data[..], b"bar");
-        let a = match d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-        {
-            Some(CodecItem::AudioFrame(a)) => a,
+        let a = match d.pull() {
+            Some(Ok(CodecItem::AudioFrame(a))) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.timestamp, timestamp.try_add(2_048).unwrap());
         assert_eq!(&a.data[..], b"baz");
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert!(d.pull().is_none());
 
         // Fragment across 3 packets.
         d.push(
@@ -839,10 +913,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // fragment 2/3.
@@ -865,10 +936,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 // fragment 3/3.
@@ -891,19 +959,13 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let a = match d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-        {
-            Some(CodecItem::AudioFrame(a)) => a,
+        let a = match d.pull() {
+            Some(Ok(CodecItem::AudioFrame(a))) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.timestamp, timestamp);
         assert_eq!(&a.data[..], b"foobarbaz");
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert_eq!(d.pull(), None);
     }
 
     /// Tests that depacketization skips/reports a frame in which its first packet was lost.
@@ -942,10 +1004,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert_eq!(d.pull(), None);
         d.push(
             ReceivedPacketBuilder {
                 ctx: crate::PacketContext::dummy(),
@@ -967,10 +1026,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert_eq!(d.pull(), None);
 
         // Following frame reports the loss.
         d.push(
@@ -995,19 +1051,13 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let a = match d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-        {
-            Some(CodecItem::AudioFrame(a)) => a,
+        let a = match d.pull() {
+            Some(Ok(CodecItem::AudioFrame(a))) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.loss, 1);
         assert_eq!(&a.data[..], b"asdf");
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert_eq!(d.pull(), None);
     }
 
     /// Tests that depacketization skips/reports a frame in which an interior frame is lost.
@@ -1046,10 +1096,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert_eq!(d.pull(), None);
         // Fragment 2/3 is lost
         d.push(
             ReceivedPacketBuilder {
@@ -1073,10 +1120,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert_eq!(d.pull(), None);
 
         // Following frame reports the loss.
         d.push(
@@ -1101,19 +1145,13 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let a = match d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-        {
-            Some(CodecItem::AudioFrame(a)) => a,
+        let a = match d.pull() {
+            Some(Ok(CodecItem::AudioFrame(a))) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.loss, 1);
         assert_eq!(&a.data[..], b"asdf");
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert_eq!(d.pull(), None);
     }
 
     /// Tests that depacketization skips/reports a frame in which the interior frame is lost.
@@ -1152,10 +1190,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert_eq!(d.pull(), None);
         // Fragment 2/3 is lost
         d.push(
             ReceivedPacketBuilder {
@@ -1179,10 +1214,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert_eq!(d.pull(), None);
 
         // Following frame reports the loss.
         d.push(
@@ -1207,19 +1239,13 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let a = match d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-        {
-            Some(CodecItem::AudioFrame(a)) => a,
+        let a = match d.pull() {
+            Some(Ok(CodecItem::AudioFrame(a))) => a,
             _ => unreachable!(),
         };
         assert_eq!(a.loss, 1);
         assert_eq!(&a.data[..], b"asdf");
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert_eq!(d.pull(), None);
     }
 
     /// Tests the distinction between `loss` and `loss_since_last_mark`.
@@ -1261,10 +1287,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap()
-            .is_none());
+        assert_eq!(d.pull(), None);
 
         // Incomplete fragment with no reported loss.
         d.push(
@@ -1289,15 +1312,166 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let e = d
-            .pull(&ConnectionContext::dummy(), &StreamContext::dummy())
-            .unwrap_err();
-        let e_str = e.to_string();
-        assert!(
-            e_str.contains("mark can't be set on beginning of fragment"),
-            "{}",
-            e
-        );
+        match d.pull() {
+            Some(Err(e)) => assert!(
+                e.description
+                    .contains("mark can't be set on beginning of fragment"),
+                "{e:?}",
+            ),
+            _ => panic!(),
+        }
+    }
+
+    /// Tests ADTS framing: single frame, aggregate, and fragment paths.
+    #[test]
+    fn adts_framing() {
+        // config=1188: audio_object_type=2 (AAC-LC), sampling_frequency_index=3 (48kHz),
+        // channel_config=1 (mono).
+        let mut d = Depacketizer::new(
+            48_000,
+            None,
+            Some("streamtype=5;profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=1188"),
+        ).unwrap();
+        let get_extra_data = |d: &Depacketizer| match d.parameters().unwrap() {
+            crate::codec::ParametersRef::Audio(a) => a.extra_data().to_vec(),
+            _ => panic!(),
+        };
+        assert!(!get_extra_data(&d).is_empty());
+        d.set_frame_format(crate::codec::FrameFormat::SIMPLE);
+        assert!(get_extra_data(&d).is_empty());
+        let timestamp = crate::Timestamp {
+            timestamp: 42,
+            clock_rate: NonZeroU32::new(48_000).unwrap(),
+            start: 0,
+        };
+
+        // Single frame.
+        d.push(
+            ReceivedPacketBuilder {
+                ctx: PacketContext::dummy(),
+                stream_id: 0,
+                sequence_number: 0,
+                timestamp,
+                payload_type: 0,
+                ssrc: 0,
+                mark: true,
+                loss: 0,
+            }
+            .build([
+                0x00, 0x10, // AU-headers-length: 1 header
+                0x00, 0x20, // AU-header: AU-size=4 + AU-index=0
+                b'a', b's', b'd', b'f',
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let a = match d.pull() {
+            Some(Ok(CodecItem::AudioFrame(a))) => a,
+            o => panic!("{o:?}"),
+        };
+        // 7-byte ADTS header + 4-byte payload.
+        // profile=1 (AAC-LC), freq_index=3, channel=1, frame_length=11.
+        assert_eq!(a.data.len(), 7 + 4);
+        // Check syncword and basic fields.
+        assert_eq!(a.data[0], 0xFF);
+        assert_eq!(a.data[1], 0xF1); // MPEG-4, protection_absent=1
+        // Byte 2: profile=1 (01 << 6) | freq_index=3 (0011 << 2) | channel_config>>2=0 = 0x4C
+        assert_eq!(a.data[2], 0x4C);
+        // Byte 3: channel_config&3=1 (01 << 6) | frame_length>>11 = 0x40
+        assert_eq!(a.data[3], 0x40);
+        // Byte 4: frame_length=11 >> 3 = 0x01 (middle 8 bits of 11 = 0b00000001011)
+        assert_eq!(a.data[4], 0x01);
+        // Byte 5: frame_length low 3 bits (011 << 5) | 0x1F = 0x7F
+        assert_eq!(a.data[5], 0x7F);
+        // Byte 6: 0xFC (buffer fullness VBR low bits + 0 raw data blocks)
+        assert_eq!(a.data[6], 0xFC);
+        // Payload follows header.
+        assert_eq!(&a.data[7..], b"asdf");
+        assert_eq!(d.pull(), None);
+
+        // Aggregate of 2 frames — each should get its own ADTS header.
+        d.push(
+            ReceivedPacketBuilder {
+                ctx: PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 1,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build([
+                0x00, 0x20, // AU-headers-length: 2 headers
+                0x00, 0x18, // AU-header: AU-size=3 + AU-index=0
+                0x00, 0x18, // AU-header: AU-size=3 + AU-index-delta=0
+                b'f', b'o', b'o', b'b', b'a', b'r',
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let a1 = match d.pull() {
+            Some(Ok(CodecItem::AudioFrame(a))) => a,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(a1.data.len(), 7 + 3);
+        assert_eq!(&a1.data[..2], &[0xFF, 0xF1]);
+        assert_eq!(&a1.data[7..], b"foo");
+        let a2 = match d.pull() {
+            Some(Ok(CodecItem::AudioFrame(a))) => a,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(a2.data.len(), 7 + 3);
+        assert_eq!(&a2.data[7..], b"bar");
+        assert_eq!(d.pull(), None);
+
+        // Fragment across 2 packets.
+        d.push(
+            ReceivedPacketBuilder {
+                ctx: PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 2,
+                loss: 0,
+                mark: false,
+                payload_type: 0,
+            }
+            .build([
+                0x00, 0x10, // 1 header
+                0x00, 0x30, // AU-size=6
+                b'f', b'o', b'o',
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(d.pull(), None);
+        d.push(
+            ReceivedPacketBuilder {
+                ctx: PacketContext::dummy(),
+                stream_id: 0,
+                timestamp,
+                ssrc: 0,
+                sequence_number: 3,
+                loss: 0,
+                mark: true,
+                payload_type: 0,
+            }
+            .build([
+                0x00, 0x10, // 1 header
+                0x00, 0x30, // AU-size=6
+                b'b', b'a', b'r',
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let a = match d.pull() {
+            Some(Ok(CodecItem::AudioFrame(a))) => a,
+            o => panic!("{o:?}"),
+        };
+        assert_eq!(a.data.len(), 7 + 6);
+        assert_eq!(&a.data[..2], &[0xFF, 0xF1]);
+        assert_eq!(&a.data[7..], b"foobar");
+        assert_eq!(d.pull(), None);
     }
 }
-

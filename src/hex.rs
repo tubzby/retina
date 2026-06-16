@@ -1,4 +1,4 @@
-// Copyright (C) 2022 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Quick wrapper around `pretty-hex` to limit output.
@@ -16,7 +16,7 @@ impl<'a> LimitedHex<'a> {
     }
 }
 
-impl<'a> std::fmt::Display for LimitedHex<'a> {
+impl std::fmt::Display for LimitedHex<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -32,7 +32,7 @@ impl<'a> std::fmt::Display for LimitedHex<'a> {
     }
 }
 
-impl<'a> std::fmt::Debug for LimitedHex<'a> {
+impl std::fmt::Debug for LimitedHex<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,

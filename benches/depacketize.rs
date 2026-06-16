@@ -1,10 +1,10 @@
-// Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::num::NonZeroU16;
 
-use criterion::{criterion_group, criterion_main, Criterion};
-use retina::client::{rtp::InorderParser, Timeline};
+use criterion::{Criterion, criterion_group, criterion_main};
+use retina::client::{Timeline, rtp::InorderParser};
 use retina::codec::{CodecItem, Depacketizer};
 use std::convert::TryFrom;
 use std::io::Write;
@@ -70,11 +70,8 @@ fn h264_aac<F: FnMut(CodecItem)>(mut f: F) {
             _ => unreachable!(),
         };
         depacketizers[stream_id].push(pkt).unwrap();
-        while let Some(pkt) = depacketizers[stream_id]
-            .pull(&conn_ctx, &stream_ctx)
-            .unwrap()
-        {
-            f(pkt);
+        while let Some(pkt) = depacketizers[stream_id].pull() {
+            f(pkt.unwrap());
         }
     }
 }

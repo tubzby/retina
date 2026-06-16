@@ -1,4 +1,4 @@
-// Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! High-level RTSP library.
@@ -13,20 +13,23 @@
 use bytes::Bytes;
 use log::trace;
 use rand::Rng;
-use rtsp_types::Message;
+use rtsp::msg::Message;
 use std::fmt::{Debug, Display};
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::num::NonZeroU32;
 use std::ops::Range;
+use std::time::{Instant, SystemTime};
 
 mod error;
 
 mod hex;
+mod mostly_ascii;
 pub mod rtcp;
 pub mod rtp;
 
-#[cfg(test)]
-mod testutil;
+/// This is exposed for the fuzz tests. It is not a stable interface.
+#[doc(hidden)]
+pub mod testutil;
 
 pub use error::Error;
 
@@ -46,6 +49,8 @@ macro_rules! wrap {
 pub mod client;
 pub mod codec;
 //mod error;
+#[doc(hidden)]
+pub mod rtsp;
 mod tokio;
 
 use error::ErrorInt;
@@ -54,7 +59,8 @@ use error::ErrorInt;
 #[derive(Debug)]
 struct ReceivedMessage {
     ctx: RtspMessageContext,
-    msg: Message<Bytes>,
+    msg: Message,
+    body: Bytes,
 }
 
 /// An annotated RTP timestamp.
@@ -204,21 +210,11 @@ impl std::fmt::Display for NtpTimestamp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let since_epoch = self.0.wrapping_sub(UNIX_EPOCH.0);
         let sec_since_epoch = (since_epoch >> 32) as u32;
-        let tm = time::at(time::Timespec {
-            sec: i64::from(sec_since_epoch),
-            nsec: 0,
-        });
-        let ms = ((since_epoch & 0xFFFF_FFFF) * 1_000) >> 32;
-        let zone_minutes = tm.tm_utcoff.abs() / 60;
-        write!(
-            f,
-            "{}.{:03}{}{:02}:{:02}",
-            tm.strftime("%FT%T").map_err(|_| std::fmt::Error)?,
-            ms,
-            if tm.tm_utcoff > 0 { '+' } else { '-' },
-            zone_minutes / 60,
-            zone_minutes % 60
-        )
+        let ns = i32::try_from(((since_epoch & 0xFFFF_FFFF) * 1_000_000_000) >> 32)
+            .expect("should be < 1_000_000_000");
+        let tm = jiff::Timestamp::new(i64::from(sec_since_epoch), ns)
+            .expect("u32 sec should be valid Timestamp");
+        std::fmt::Display::fmt(&tm, f)
     }
 }
 
@@ -231,24 +227,28 @@ impl std::fmt::Debug for NtpTimestamp {
 
 /// A wall time taken from the local machine's realtime clock, used in error reporting.
 ///
-/// Currently this just allows formatting via `Debug` and `Display`.
-#[derive(Copy, Clone, Debug)]
-pub struct WallTime(time::Timespec);
+/// This allows formatting via `Debug` and `Display` and conversion to [`SystemTime`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct WallTime(jiff::Timestamp);
 
 impl WallTime {
+    #[inline]
     fn now() -> Self {
-        Self(time::get_time())
+        Self(jiff::Timestamp::now())
     }
 }
 
 impl Display for WallTime {
+    #[inline]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(
-            &time::at(self.0)
-                .strftime("%FT%T")
-                .map_err(|_| std::fmt::Error)?,
-            f,
-        )
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl From<WallTime> for SystemTime {
+    #[inline]
+    fn from(wall_time: WallTime) -> Self {
+        wall_time.0.into()
     }
 }
 
@@ -290,7 +290,7 @@ impl Display for ConnectionContext {
 ///
 /// When paired with a [`ConnectionContext`], this should allow picking the
 /// message out of a packet capture.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct RtspMessageContext {
     /// The starting byte position within the input stream. The bottom 32 bits
     /// can be compared to the relative TCP sequence number.
@@ -406,52 +406,56 @@ impl Display for UdpStreamContext {
 /// Should be paired with an [`ConnectionContext`] of the RTSP connection that started
 /// the session. In the interleaved data case, it's assumed the packet was received over
 /// that same connection.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct PacketContext(PacketContextInner);
 
 impl PacketContext {
+    #[inline]
+    pub fn received(&self) -> Instant {
+        match self.0 {
+            PacketContextInner::Tcp { msg_ctx } => msg_ctx.received,
+            PacketContextInner::Udp { received, .. } => received,
+            PacketContextInner::Dummy => Instant::now(),
+        }
+    }
+
+    #[inline]
+    pub fn received_wall(&self) -> WallTime {
+        match self.0 {
+            PacketContextInner::Tcp { msg_ctx } => msg_ctx.received_wall,
+            PacketContextInner::Udp { received_wall, .. } => received_wall,
+            PacketContextInner::Dummy => WallTime::now(),
+        }
+    }
+
     #[doc(hidden)]
     pub fn dummy() -> PacketContext {
         Self(PacketContextInner::Dummy)
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum PacketContextInner {
-    Tcp { msg_ctx: RtspMessageContext },
-    Udp { received_wall: WallTime },
+    Tcp {
+        msg_ctx: RtspMessageContext,
+    },
+    Udp {
+        received: Instant,
+        received_wall: WallTime,
+    },
     Dummy,
 }
 
 impl Display for PacketContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
-            PacketContextInner::Udp { received_wall } => std::fmt::Display::fmt(&received_wall, f),
+            PacketContextInner::Udp { received_wall, .. } => {
+                std::fmt::Display::fmt(&received_wall, f)
+            }
             PacketContextInner::Tcp { msg_ctx } => std::fmt::Display::fmt(&msg_ctx, f),
             PacketContextInner::Dummy => write!(f, "dummy"),
         }
     }
-}
-
-/// Returns the range within `buf` that represents `subset`.
-/// If `subset` is empty, returns None; otherwise panics if `subset` is not within `buf`.
-pub(crate) fn as_range(buf: &[u8], subset: &[u8]) -> Option<std::ops::Range<usize>> {
-    if subset.is_empty() {
-        return None;
-    }
-    let subset_p = subset.as_ptr() as usize;
-    let buf_p = buf.as_ptr() as usize;
-    let off = match subset_p.checked_sub(buf_p) {
-        Some(off) => off,
-        None => panic!(
-            "{}-byte subset not within {}-byte buf",
-            subset.len(),
-            buf.len()
-        ),
-    };
-    let end = off + subset.len();
-    assert!(end <= buf.len());
-    Some(off..end)
 }
 
 /// A pair of local UDP sockets used for RTP and RTCP transmission.
@@ -477,9 +481,7 @@ impl UdpPair {
                 Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                     trace!(
                         "Try {}/{}: unable to bind RTP addr {:?}",
-                        i,
-                        MAX_TRIES,
-                        rtp_addr
+                        i, MAX_TRIES, rtp_addr
                     );
                     continue;
                 }
@@ -491,9 +493,7 @@ impl UdpPair {
                 Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                     trace!(
                         "Try {}/{}: unable to bind RTCP addr {:?}",
-                        i,
-                        MAX_TRIES,
-                        rtcp_addr
+                        i, MAX_TRIES, rtcp_addr
                     );
                     continue;
                 }
@@ -513,6 +513,21 @@ impl UdpPair {
             ),
         ))
     }
+}
+
+// Let's assume pointers are either 32-bit or 64-bit so we can do the following
+// infallible conversions.
+fn to_usize<V: Into<u32>>(v: V) -> usize {
+    const {
+        assert!(std::mem::size_of::<u32>() <= std::mem::size_of::<usize>());
+    }
+    v.into() as usize
+}
+fn to_u64(v: usize) -> u64 {
+    const {
+        assert!(std::mem::size_of::<usize>() <= std::mem::size_of::<u64>());
+    }
+    v as u64
 }
 
 #[cfg(test)]

@@ -1,9 +1,11 @@
-// Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! G.723.1 audio as specified in [RFC 3551 section 4.5.3](https://datatracker.ietf.org/doc/html/rfc3551#section-4.5.3).
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU16, NonZeroU32};
+
+use crate::codec::DepacketizeError;
 
 use super::AudioParameters;
 
@@ -29,13 +31,14 @@ impl Depacketizer {
                 rfc6381_codec: None,
                 frame_length: NonZeroU32::new(240),
                 clock_rate: FIXED_CLOCK_RATE,
+                channels: const { NonZeroU16::new(1).unwrap() },
                 extra_data: Vec::new(),
-                sample_entry: None,
+                codec: super::AudioParametersCodec::Other,
             },
         })
     }
 
-    pub(super) fn parameters(&self) -> Option<super::ParametersRef> {
+    pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
         Some(super::ParametersRef::Audio(&self.parameters))
     }
 
@@ -70,8 +73,9 @@ impl Depacketizer {
         Ok(())
     }
 
-    pub(super) fn pull(&mut self) -> Option<super::CodecItem> {
-        self.pending.take().map(super::CodecItem::AudioFrame)
+    pub(super) fn pull(&mut self) -> Option<Result<super::CodecItem, DepacketizeError>> {
+        self.pending
+            .take()
+            .map(|f| Ok(super::CodecItem::AudioFrame(f)))
     }
 }
-

@@ -1,4 +1,4 @@
-// Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Handles RTP data as described in
@@ -28,6 +28,7 @@ const MIN_HEADER_LEN: u16 = 12;
 ///     model](https://github.com/scottlamb/retina/issues/6).
 /// *   directly exposes the sequence number as a `u16`, rather than having an
 ///     extra type that I find awkward to work with.
+#[derive(Eq, PartialEq)]
 pub(crate) struct RawPacket(
     /// Full packet data, including headers.
     ///
@@ -63,7 +64,7 @@ impl RawPacket {
                 return Err(RawPacketError {
                     reason: "too long",
                     data,
-                })
+                });
             }
         };
         if len < MIN_HEADER_LEN {
@@ -114,7 +115,7 @@ impl RawPacket {
                     return Err(RawPacketError {
                         reason: "extension extends beyond maximum packet size",
                         data,
-                    })
+                    });
                 }
             }
         } else {
@@ -146,7 +147,7 @@ impl RawPacket {
                     return Err(RawPacketError {
                         reason: "padding larger than packet",
                         data,
-                    })
+                    });
                 }
             };
             if payload_end < payload_start {
@@ -233,6 +234,7 @@ impl RawPacketBuilder {
 ///
 /// This holds more information than the packet itself: also a
 /// [`PacketContext`], the stream, and extended timestamp.
+#[derive(Eq, PartialEq)]
 pub struct ReceivedPacket {
     // Currently this is constructed from crate::client::rtp, so everything here
     // is pub(crate).

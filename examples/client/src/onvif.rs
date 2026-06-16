@@ -1,7 +1,7 @@
-// Copyright (C) 2021 Scott Lamb <slamb@slamb.org>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::{anyhow, Error};
+use anyhow::{Error, anyhow};
 use clap::Parser;
 use futures::StreamExt;
 use log::{error, info};

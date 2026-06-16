@@ -1,4 +1,4 @@
-// Copyright (C) 2023 Niclas Olmenius <niclas@voysys.se>
+// Copyright (C) The Retina Authors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! [JPEG](https://www.itu.int/rec/T-REC-T.81-199209-I/en)-encoded video.
@@ -19,7 +19,7 @@
 
 use bytes::{Buf, Bytes};
 
-use crate::{rtp::ReceivedPacket, PacketContext, Timestamp};
+use crate::{PacketContext, Timestamp, codec::AllPixelDimensions, rtp::ReceivedPacket};
 
 use super::{VideoFrame, VideoParameters};
 
@@ -446,7 +446,10 @@ impl Depacketizer {
                         start_ctx: ctx,
                         timestamp,
                         parameters: Some(VideoParameters {
-                            pixel_dimensions: (width, height),
+                            all_pixel_dimensions: AllPixelDimensions {
+                                coded: (width, height),
+                                display: (width, height),
+                            },
                             rfc6381_codec: "mp4v.6C".to_owned(),
                             pixel_aspect_ratio: None,
                             frame_rate: None,
@@ -500,10 +503,10 @@ impl Depacketizer {
             });
 
             let metadata = self.metadata.take();
-            if let Some(metadata) = metadata {
-                if has_new_parameters {
-                    self.parameters = metadata.parameters;
-                }
+            if let Some(metadata) = metadata
+                && has_new_parameters
+            {
+                self.parameters = metadata.parameters;
             }
         }
 
@@ -515,11 +518,13 @@ impl Depacketizer {
         Ok(())
     }
 
-    pub(super) fn pull(&mut self) -> Option<super::CodecItem> {
-        self.pending.take().map(super::CodecItem::VideoFrame)
+    pub(super) fn pull(&mut self) -> Option<Result<super::CodecItem, super::DepacketizeError>> {
+        self.pending
+            .take()
+            .map(|f| Ok(super::CodecItem::VideoFrame(f)))
     }
 
-    pub(super) fn parameters(&self) -> Option<super::ParametersRef> {
+    pub(super) fn parameters(&self) -> Option<super::ParametersRef<'_>> {
         self.parameters.as_ref().map(super::ParametersRef::Video)
     }
 }
@@ -871,7 +876,7 @@ mod tests {
         .unwrap();
 
         let frame = match d.pull() {
-            Some(CodecItem::VideoFrame(frame)) => frame,
+            Some(Ok(CodecItem::VideoFrame(frame))) => frame,
             _ => panic!(),
         };
         assert_eq_hex!(frame.data(), VALID_JPEG_IMAGE)
